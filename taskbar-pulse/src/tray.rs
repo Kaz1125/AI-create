@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{Anchor, Config, Item, Mode};
+use crate::config::{Anchor, Config, Item, Mode, Sensitivity};
 use crate::WM_APP_TRAY;
 
 const ID_ITEM: u16 = 100;
@@ -15,6 +15,7 @@ const ID_MODE: u16 = 200;
 const ID_ANCHOR_TRAY: u16 = 300;
 const ID_ANCHOR_LEFT: u16 = 301;
 const ID_FONT: u16 = 310;
+const ID_SENS: u16 = 315;
 const ID_FULLSCREEN: u16 = 320;
 const ID_AUTOSTART: u16 = 330;
 const ID_OPEN_CONFIG: u16 = 340;
@@ -26,6 +27,7 @@ pub enum Action {
     SetMode(Mode),
     SetAnchor(Anchor),
     FontSize(f32),
+    SetSensitivity(Sensitivity),
     ToggleFullscreenHide,
     ToggleAutostart,
     OpenConfig,
@@ -45,6 +47,9 @@ pub fn decode(id: u16) -> Action {
         ID_ANCHOR_LEFT => Action::SetAnchor(Anchor::Left),
         i if (ID_FONT..ID_FONT + FONT_SIZES.len() as u16).contains(&i) => {
             Action::FontSize(FONT_SIZES[(i - ID_FONT) as usize].0)
+        }
+        i if (ID_SENS..ID_SENS + Sensitivity::ALL.len() as u16).contains(&i) => {
+            Action::SetSensitivity(Sensitivity::ALL[(i - ID_SENS) as usize])
         }
         ID_FULLSCREEN => Action::ToggleFullscreenHide,
         ID_AUTOSTART => Action::ToggleAutostart,
@@ -164,6 +169,12 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
             append(fonts, MF_STRING | check((cfg.font_size - size).abs() < 0.1), (ID_FONT + i as u16) as usize, name);
         }
         append(menu, MF_POPUP, fonts.0 as usize, "文字サイズ");
+
+        let sens = CreatePopupMenu().unwrap_or_default();
+        for (i, s) in Sensitivity::ALL.iter().enumerate() {
+            append(sens, MF_STRING | check(cfg.visualizer_sensitivity == *s), (ID_SENS + i as u16) as usize, s.label());
+        }
+        append(menu, MF_POPUP, sens.0 as usize, "ビジュアライザー感度");
 
         append(menu, MF_SEPARATOR, 0, "");
         append(menu, MF_STRING | check(cfg.hide_in_fullscreen), ID_FULLSCREEN as usize, "全画面アプリ・ゲーム中は隠す");

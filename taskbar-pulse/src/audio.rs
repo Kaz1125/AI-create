@@ -1,7 +1,7 @@
 //! Audio visualizer input: WASAPI loopback capture of the default playback device,
 //! turned into log-spaced frequency bars with an FFT.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,16 +16,20 @@ pub struct Visualizer {
     pub bars: Arc<Mutex<Vec<f32>>>,
     pub enabled: Arc<AtomicBool>,
     pub bar_count: Arc<AtomicUsize>,
+    /// 0 = normal, 1 = high, 2 = auto gain. See `config::Sensitivity`.
+    pub sensitivity: Arc<AtomicU8>,
 }
 
 impl Visualizer {
-    pub fn start(bar_count: usize, enabled: bool) -> Visualizer {
+    pub fn start(bar_count: usize, enabled: bool, sensitivity: u8) -> Visualizer {
         let v = Visualizer {
             bars: Arc::new(Mutex::new(vec![0.0; bar_count])),
             enabled: Arc::new(AtomicBool::new(enabled)),
             bar_count: Arc::new(AtomicUsize::new(bar_count)),
+            sensitivity: Arc::new(AtomicU8::new(sensitivity)),
         };
-        let (bars, en, count) = (v.bars.clone(), v.enabled.clone(), v.bar_count.clone());
+        let (bars, en, count, sens) =
+            (v.bars.clone(), v.enabled.clone(), v.bar_count.clone(), v.sensitivity.clone());
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
@@ -39,7 +43,7 @@ impl Visualizer {
                         continue;
                     }
                     // Returns when the device changes/disappears or the visualizer is disabled.
-                    let _ = capture(&bars, &en, &count);
+                    let _ = capture(&bars, &en, &count, &sens);
                     std::thread::sleep(Duration::from_millis(500));
                 }
             })
@@ -77,7 +81,12 @@ unsafe fn mix_format(client: &IAudioClient) -> windows::core::Result<(*mut WAVEF
     ))
 }
 
-fn capture(bars: &Mutex<Vec<f32>>, enabled: &AtomicBool, count: &AtomicUsize) -> windows::core::Result<()> {
+fn capture(
+    bars: &Mutex<Vec<f32>>,
+    enabled: &AtomicBool,
+    count: &AtomicUsize,
+    sensitivity: &AtomicU8,
+) -> windows::core::Result<()> {
     unsafe {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
@@ -108,6 +117,7 @@ fn capture(bars: &Mutex<Vec<f32>>, enabled: &AtomicBool, count: &AtomicUsize) ->
         let mut buffer = vec![Complex::new(0.0f32, 0.0); FFT_SIZE];
         let mut checks = 0u32;
         let mut silent_ticks = 0u32;
+        let mut gain = AutoGain::new();
 
         let outcome = loop {
             if !enabled.load(Ordering::Relaxed) {
@@ -180,7 +190,8 @@ fn capture(bars: &Mutex<Vec<f32>>, enabled: &AtomicBool, count: &AtomicUsize) ->
                     buffer[i] = Complex::new(s * window[i], 0.0);
                 }
                 fft.process(&mut buffer);
-                let target = bands(&buffer, fmt.sample_rate, bar_count);
+                let db = bands_db(&buffer, fmt.sample_rate, bar_count);
+                let target = gain.scale(&db, sensitivity.load(Ordering::Relaxed));
                 for (s, t) in smooth.iter_mut().zip(target) {
                     // Fast attack, slower release.
                     *s = if t > *s { *s + (t - *s) * 0.6 } else { *s + (t - *s) * 0.25 };
@@ -199,8 +210,8 @@ fn capture(bars: &Mutex<Vec<f32>>, enabled: &AtomicBool, count: &AtomicUsize) ->
     }
 }
 
-/// Groups FFT bins into `count` log-spaced bands between 40 Hz and 16 kHz, scaled 0..1.
-fn bands(spectrum: &[Complex<f32>], sample_rate: f32, count: usize) -> Vec<f32> {
+/// Groups FFT bins into `count` log-spaced bands between 40 Hz and 16 kHz, in dBFS.
+fn bands_db(spectrum: &[Complex<f32>], sample_rate: f32, count: usize) -> Vec<f32> {
     let half = FFT_SIZE / 2;
     let bin_hz = sample_rate / FFT_SIZE as f32;
     let (lo, hi) = (40.0f32, 16_000.0f32.min(sample_rate / 2.0));
@@ -212,8 +223,49 @@ fn bands(spectrum: &[Complex<f32>], sample_rate: f32, count: usize) -> Vec<f32> 
             let i1 = ((f1 / bin_hz) as usize).clamp(i0 + 1, half);
             let peak = spectrum[i0..i1].iter().map(|c| c.norm()).fold(0.0f32, f32::max);
             let mag = peak / (FFT_SIZE as f32 / 4.0);
-            let db = 20.0 * mag.max(1e-9).log10();
-            ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+            20.0 * mag.max(1e-9).log10()
         })
         .collect()
+}
+
+/// Maps band levels (dBFS) to bar heights 0..1.
+///
+/// - Normal (0): fixed window -60..0 dBFS.
+/// - High (1): fixed window -85..-25 dBFS, for quiet playback.
+/// - Auto (2): follows the loudest recent band so quiet and loud music both fill the bars.
+///   The reference rises instantly and falls about 6 dB per second; anything quieter than
+///   -110 dBFS is treated as silence so background noise is not amplified.
+struct AutoGain {
+    reference_db: f32,
+}
+
+impl AutoGain {
+    const RANGE_DB: f32 = 48.0;
+    const FALL_PER_FRAME_DB: f32 = 0.065; // frames arrive ~94 times/s at 48 kHz
+    const SILENCE_DB: f32 = -110.0;
+
+    fn new() -> AutoGain {
+        AutoGain { reference_db: -40.0 }
+    }
+
+    fn scale(&mut self, db: &[f32], mode: u8) -> Vec<f32> {
+        let (floor, range) = match mode {
+            0 => (-60.0, 60.0),
+            1 => (-85.0, 60.0),
+            _ => {
+                let loudest = db.iter().cloned().fold(f32::MIN, f32::max);
+                self.reference_db = if loudest > self.reference_db {
+                    loudest
+                } else {
+                    // Never chase below -70 dBFS, so near-silence does not become full-height bars.
+                    (self.reference_db - Self::FALL_PER_FRAME_DB).max(-70.0)
+                };
+                if loudest < Self::SILENCE_DB {
+                    return vec![0.0; db.len()];
+                }
+                (self.reference_db - Self::RANGE_DB, Self::RANGE_DB)
+            }
+        };
+        db.iter().map(|d| ((d - floor) / range).clamp(0.0, 1.0)).collect()
+    }
 }

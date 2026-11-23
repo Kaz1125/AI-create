@@ -110,6 +110,37 @@ impl Mode {
     }
 }
 
+/// How strongly the visualizer reacts to the audio level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sensitivity {
+    /// Fixed scale; quiet audio gives small bars.
+    Normal,
+    /// Fixed scale shifted ~25 dB for quiet playback.
+    High,
+    /// Automatic gain: adapts to the current loudness.
+    Auto,
+}
+
+impl Sensitivity {
+    pub const ALL: [Sensitivity; 3] = [Sensitivity::Auto, Sensitivity::High, Sensitivity::Normal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Sensitivity::Normal => "標準",
+            Sensitivity::High => "高感度 (小さい音でも反応)",
+            Sensitivity::Auto => "自動 (音量に合わせて自動調整)",
+        }
+    }
+
+    pub fn code(self) -> u8 {
+        match self {
+            Sensitivity::Normal => 0,
+            Sensitivity::High => 1,
+            Sensitivity::Auto => 2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Anchor {
     /// Right edge of the overlay sits just left of the notification area.
@@ -134,6 +165,8 @@ pub struct Config {
     pub media_max_chars: usize,
     /// Number of visualizer bars.
     pub visualizer_bars: usize,
+    /// Visualizer sensitivity.
+    pub visualizer_sensitivity: Sensitivity,
     /// Text colour as 0xRRGGBB.
     pub text_color: u32,
     /// Label colour as 0xRRGGBB.
@@ -163,6 +196,7 @@ impl Default for Config {
             hide_in_fullscreen: true,
             media_max_chars: 28,
             visualizer_bars: 16,
+            visualizer_sensitivity: Sensitivity::Auto,
             text_color: 0xFFFFFF,
             label_color: 0xC8C8C8,
             accent_color: 0x4FC3F7,

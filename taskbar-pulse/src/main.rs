@@ -162,6 +162,7 @@ impl App {
         self.renderer.set_hardware(mode.hardware_rendering());
         let _ = self.media_tx.send(MediaCommand::Interval(mode.sensor_interval_ms().max(1000)));
         self.visualizer.bar_count.store(self.config.visualizer_bars, Ordering::Relaxed);
+        self.visualizer.sensitivity.store(self.config.visualizer_sensitivity.code(), Ordering::Relaxed);
         let viz = self.visualizer_active();
         self.visualizer.enabled.store(viz, Ordering::Relaxed);
         unsafe {
@@ -337,6 +338,12 @@ fn handle_command(hwnd: HWND, id: u16) {
                 app.apply_config();
             });
         }
+        tray::Action::SetSensitivity(sens) => {
+            with_app(|app| {
+                app.config.visualizer_sensitivity = sens;
+                app.apply_config();
+            });
+        }
         tray::Action::FontSize(size) => {
             with_app(|app| {
                 app.config.font_size = size;
@@ -458,7 +465,8 @@ fn main() -> windows::core::Result<()> {
         }
 
         let viz_on = config.has(Item::Visualizer) && config.mode.visualizer_interval_ms().is_some();
-        let visualizer = audio::Visualizer::start(config.visualizer_bars, viz_on);
+        let visualizer =
+            audio::Visualizer::start(config.visualizer_bars, viz_on, config.visualizer_sensitivity.code());
         let hybrid = hybrid_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false);
 
         let app = App {
