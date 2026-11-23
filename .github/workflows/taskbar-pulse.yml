@@ -1,0 +1,26 @@
+name: taskbar-pulse
+
+on:
+  push:
+    paths: ["taskbar-pulse/**", ".github/workflows/taskbar-pulse.yml"]
+  pull_request:
+    paths: ["taskbar-pulse/**", ".github/workflows/taskbar-pulse.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: taskbar-pulse
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: taskbar-pulse
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taskbar-pulse-windows-x64
+          path: taskbar-pulse/target/release/taskbar-pulse.exe

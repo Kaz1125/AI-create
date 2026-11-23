@@ -1,0 +1,496 @@
+//! Taskbar Pulse: shows hardware usage, now-playing media and an audio visualizer
+//! on the Windows taskbar.
+#![windows_subsystem = "windows"]
+
+mod audio;
+mod config;
+mod media;
+mod render;
+mod sensors;
+mod tray;
+
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::*;
+use windows::Win32::System::Com::*;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::HiDpi::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+use config::{Anchor, Config, Item};
+use media::{MediaCommand, MediaInfo};
+use sensors::battery::DeviceKind;
+use sensors::Snapshot;
+
+pub const WM_APP_SENSORS: u32 = WM_APP + 1;
+pub const WM_APP_MEDIA: u32 = WM_APP + 2;
+pub const WM_APP_TRAY: u32 = WM_APP + 3;
+const TIMER_VISUALIZER: usize = 1;
+const TIMER_POSITION: usize = 2;
+
+pub fn battery_kind_glyph(kind: DeviceKind) -> char {
+    match kind {
+        DeviceKind::Mouse => '\u{E962}',
+        DeviceKind::Keyboard => '\u{E765}',
+        DeviceKind::Gamepad => '\u{E7FC}',
+        DeviceKind::Headset => '\u{E7F6}',
+        DeviceKind::Other => '\u{E702}', // Bluetooth
+    }
+}
+
+struct App {
+    hwnd: HWND,
+    config: Config,
+    renderer: render::Renderer,
+    snapshot: Arc<Mutex<Snapshot>>,
+    media: Arc<Mutex<Option<MediaInfo>>>,
+    media_tx: Sender<MediaCommand>,
+    visualizer: audio::Visualizer,
+    sensor_interval: Arc<AtomicU32>,
+    want_devices: Arc<AtomicBool>,
+    hybrid: bool,
+    last_viz_zero: bool,
+    hidden_for_fullscreen: bool,
+    /// Drag state: (cursor x at press, offset at press, moved?)
+    drag: Option<(i32, i32, bool)>,
+    taskbar_created_msg: u32,
+}
+
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+}
+
+fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    APP.with(|a| a.try_borrow_mut().ok().and_then(|mut a| a.as_mut().map(f)))
+}
+
+/// Where the taskbar is and where our strip should go.
+struct Placement {
+    taskbar: RECT,
+    tray_left: i32,
+    scale: f32,
+}
+
+fn placement() -> Option<Placement> {
+    unsafe {
+        let taskbar = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
+        let mut rect = RECT::default();
+        GetWindowRect(taskbar, &mut rect).ok()?;
+        let dpi = GetDpiForWindow(taskbar);
+        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+        // Notification area. Present on Windows 10 and 11 (the 11 taskbar still keeps this
+        // window for compatibility); fall back to a fixed margin if it is missing.
+        let tray_left = FindWindowExW(Some(taskbar), None, w!("TrayNotifyWnd"), PCWSTR::null())
+            .ok()
+            .and_then(|tray| {
+                let mut r = RECT::default();
+                GetWindowRect(tray, &mut r).ok().map(|_| r.left)
+            })
+            .filter(|l| *l > rect.left && *l < rect.right)
+            .unwrap_or(rect.right - (320.0 * scale) as i32);
+        Some(Placement { taskbar: rect, tray_left, scale })
+    }
+}
+
+fn fullscreen_app_active() -> bool {
+    unsafe {
+        match SHQueryUserNotificationState() {
+            Ok(state) => {
+                state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl App {
+    fn redraw(&mut self) {
+        if self.config.hide_in_fullscreen && fullscreen_app_active() {
+            if !self.hidden_for_fullscreen {
+                self.hidden_for_fullscreen = true;
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+            }
+            return;
+        } else if self.hidden_for_fullscreen {
+            self.hidden_for_fullscreen = false;
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+
+        let Some(p) = placement() else { return };
+        let snap = self.snapshot.lock().unwrap().clone();
+        let media = self.media.lock().unwrap().clone();
+        let viz = self.visualizer_active().then(|| self.visualizer.snapshot());
+        let segs = render::build_segments(&self.config, &snap, media.as_ref(), viz);
+        let height = p.taskbar.bottom - p.taskbar.top;
+        if height <= 0 {
+            return;
+        }
+        match self.renderer.draw(&segs, height, p.scale, &self.config) {
+            Ok((dc, w, h)) => {
+                let off = (self.config.offset_x as f32 * p.scale) as i32;
+                let x = match self.config.anchor {
+                    Anchor::BesideTray => p.tray_left - off - w,
+                    Anchor::Left => p.taskbar.left + off,
+                };
+                render::present(self.hwnd, dc, x, p.taskbar.top, w, h);
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn visualizer_active(&self) -> bool {
+        self.config.has(Item::Visualizer) && self.config.mode.visualizer_interval_ms().is_some()
+    }
+
+    /// Applies mode/item changes to the worker threads and timers.
+    fn apply_config(&mut self) {
+        let mode = self.config.mode;
+        self.sensor_interval.store(mode.sensor_interval_ms(), Ordering::Relaxed);
+        self.want_devices.store(self.config.has(Item::Devices), Ordering::Relaxed);
+        self.renderer.set_hardware(mode.hardware_rendering());
+        let _ = self.media_tx.send(MediaCommand::Interval(mode.sensor_interval_ms().max(1000)));
+        self.visualizer.bar_count.store(self.config.visualizer_bars, Ordering::Relaxed);
+        let viz = self.visualizer_active();
+        self.visualizer.enabled.store(viz, Ordering::Relaxed);
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_VISUALIZER);
+            if let Some(ms) = mode.visualizer_interval_ms().filter(|_| viz) {
+                SetTimer(Some(self.hwnd), TIMER_VISUALIZER, ms, None);
+            }
+        }
+        self.config.save();
+        self.redraw();
+    }
+
+    fn keep_on_top(&self) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+        }
+    }
+}
+
+fn lparam_x(lparam: LPARAM) -> i32 {
+    (lparam.0 & 0xFFFF) as i16 as i32
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_APP_SENSORS | WM_APP_MEDIA => {
+            with_app(|app| {
+                app.redraw();
+                app.keep_on_top();
+            });
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            with_app(|app| match wparam.0 {
+                TIMER_VISUALIZER => {
+                    // Skip frames while silent to save CPU/GPU.
+                    let zero = app.visualizer.snapshot().iter().all(|v| *v < 0.005);
+                    if !(zero && app.last_viz_zero) {
+                        app.redraw();
+                    }
+                    app.last_viz_zero = zero;
+                }
+                TIMER_POSITION => app.keep_on_top(),
+                _ => {}
+            });
+            LRESULT(0)
+        }
+        WM_APP_TRAY => {
+            let event = (lparam.0 & 0xFFFF) as u32;
+            if event == WM_RBUTTONUP || event == WM_LBUTTONUP || event == WM_CONTEXTMENU {
+                show_menu(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            show_menu(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            with_app(|app| app.drag = Some((pt.x, app.config.offset_x, false)));
+            SetCapture(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if wparam.0 & 0x0001 != 0 {
+                // MK_LBUTTON: drag the strip horizontally along the taskbar.
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                with_app(|app| {
+                    if let Some((start_x, start_off, _)) = app.drag {
+                        let dx = pt.x - start_x;
+                        if dx.abs() > 3 {
+                            let scale = placement().map(|p| p.scale).unwrap_or(1.0);
+                            let delta = (dx as f32 / scale) as i32;
+                            app.config.offset_x = match app.config.anchor {
+                                Anchor::BesideTray => start_off - delta,
+                                Anchor::Left => start_off + delta,
+                            };
+                            app.drag = Some((start_x, start_off, true));
+                            app.redraw();
+                        }
+                    }
+                });
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let _ = ReleaseCapture();
+            let x = lparam_x(lparam) as f32;
+            with_app(|app| {
+                let moved = app.drag.map(|d| d.2).unwrap_or(false);
+                app.drag = None;
+                if moved {
+                    app.config.save();
+                } else if let Some((a, b)) = app.renderer.media_hit {
+                    if x >= a && x <= b {
+                        let _ = app.media_tx.send(MediaCommand::TogglePlayPause);
+                    }
+                }
+            });
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            // Scroll over the strip: next / previous track.
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+            with_app(|app| {
+                let cmd = if delta < 0 { MediaCommand::Next } else { MediaCommand::Previous };
+                let _ = app.media_tx.send(cmd);
+            });
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            handle_command(hwnd, (wparam.0 & 0xFFFF) as u16);
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+            with_app(|app| app.redraw());
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_DESTROY => {
+            tray::remove(hwnd);
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => {
+            let recreated = with_app(|app| app.taskbar_created_msg).unwrap_or(0);
+            if recreated != 0 && msg == recreated {
+                // Explorer restarted: the tray icon must be added again.
+                tray::add(hwnd);
+                with_app(|app| app.redraw());
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+fn show_menu(hwnd: HWND) {
+    let Some((cfg, hybrid, hw)) = with_app(|app| (app.config.clone(), app.hybrid, app.renderer.is_hardware())) else {
+        return;
+    };
+    tray::show_menu(hwnd, &cfg, hybrid, hw);
+}
+
+fn handle_command(hwnd: HWND, id: u16) {
+    match tray::decode(id) {
+        tray::Action::ToggleItem(item) => {
+            with_app(|app| {
+                app.config.toggle(item);
+                app.apply_config();
+            });
+        }
+        tray::Action::SetMode(mode) => {
+            with_app(|app| {
+                app.config.mode = mode;
+                app.apply_config();
+            });
+        }
+        tray::Action::SetAnchor(anchor) => {
+            with_app(|app| {
+                app.config.anchor = anchor;
+                app.config.offset_x = Config::default().offset_x;
+                app.apply_config();
+            });
+        }
+        tray::Action::FontSize(size) => {
+            with_app(|app| {
+                app.config.font_size = size;
+                app.apply_config();
+            });
+        }
+        tray::Action::ToggleFullscreenHide => {
+            with_app(|app| {
+                app.config.hide_in_fullscreen = !app.config.hide_in_fullscreen;
+                app.apply_config();
+            });
+        }
+        tray::Action::ToggleAutostart => tray::set_autostart(!tray::autostart_enabled()),
+        tray::Action::OpenConfig => {
+            with_app(|app| app.config.save());
+            let path: Vec<u16> = Config::path().to_string_lossy().encode_utf16().chain([0]).collect();
+            unsafe {
+                ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+            }
+        }
+        tray::Action::Exit => unsafe {
+            with_app(|app| {
+                let _ = app.media_tx.send(MediaCommand::Quit);
+            });
+            let _ = DestroyWindow(hwnd);
+        },
+        tray::Action::None => {}
+    }
+}
+
+fn main() -> windows::core::Result<()> {
+    unsafe {
+        // Single instance.
+        let _mutex = CreateMutexW(None, true, w!("Local\\TaskbarPulse.SingleInstance"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            return Ok(());
+        }
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        // Process-wide COM security, needed for WMI (temperature) queries. Must run before
+        // any other thread starts using COM.
+        let _ = CoInitializeSecurity(
+            None,
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            None,
+            EOAC_NONE,
+            None,
+        );
+
+        let config = Config::load();
+        let instance = GetModuleHandleW(None)?;
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance.into(),
+            lpszClassName: w!("TaskbarPulseOverlay"),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            ..Default::default()
+        };
+        RegisterClassW(&class);
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            w!("TaskbarPulseOverlay"),
+            w!("Taskbar Pulse"),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )?;
+
+        // --- Worker threads ---
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let sensor_interval = Arc::new(AtomicU32::new(config.mode.sensor_interval_ms()));
+        let want_devices = Arc::new(AtomicBool::new(config.has(Item::Devices)));
+        let hwnd_raw = hwnd.0 as isize;
+        let (hybrid_tx, hybrid_rx) = channel();
+        {
+            let (snapshot, interval, want_devices) = (snapshot.clone(), sensor_interval.clone(), want_devices.clone());
+            std::thread::Builder::new()
+                .name("sensors".into())
+                .spawn(move || {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    let mut sensors = sensors::Sensors::new();
+                    let _ = hybrid_tx.send(sensors.is_hybrid());
+                    // First rate sample needs a short gap.
+                    std::thread::sleep(Duration::from_millis(300));
+                    loop {
+                        let snap = sensors.read(want_devices.load(Ordering::Relaxed));
+                        *snapshot.lock().unwrap() = snap;
+                        let _ = PostMessageW(Some(HWND(hwnd_raw as _)), WM_APP_SENSORS, WPARAM(0), LPARAM(0));
+                        std::thread::sleep(Duration::from_millis(interval.load(Ordering::Relaxed) as u64));
+                    }
+                })
+                .expect("spawn sensor thread");
+        }
+
+        let media_state = Arc::new(Mutex::new(None));
+        let (media_tx, media_rx) = channel();
+        {
+            let shared = media_state.clone();
+            let interval = config.mode.sensor_interval_ms().max(1000);
+            std::thread::Builder::new()
+                .name("media".into())
+                .spawn(move || {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    media::run(shared, media_rx, interval, move || {
+                        let _ = PostMessageW(Some(HWND(hwnd_raw as _)), WM_APP_MEDIA, WPARAM(0), LPARAM(0));
+                    });
+                })
+                .expect("spawn media thread");
+        }
+
+        let viz_on = config.has(Item::Visualizer) && config.mode.visualizer_interval_ms().is_some();
+        let visualizer = audio::Visualizer::start(config.visualizer_bars, viz_on);
+        let hybrid = hybrid_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false);
+
+        let app = App {
+            hwnd,
+            renderer: render::Renderer::new()?,
+            config,
+            snapshot,
+            media: media_state,
+            media_tx,
+            visualizer,
+            sensor_interval,
+            want_devices,
+            hybrid,
+            last_viz_zero: false,
+            hidden_for_fullscreen: false,
+            drag: None,
+            taskbar_created_msg: RegisterWindowMessageW(w!("TaskbarCreated")),
+        };
+        APP.with(|a| *a.borrow_mut() = Some(app));
+        with_app(|app| app.apply_config());
+
+        tray::add(hwnd);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetTimer(Some(hwnd), TIMER_POSITION, 2000, None);
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        APP.with(|a| a.borrow_mut().take());
+        CoUninitialize();
+        Ok(())
+    }
+}
