@@ -141,6 +141,118 @@ impl Sensitivity {
     }
 }
 
+/// Colour theme. `Custom` uses the colours stored in the config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    Aurora,
+    Sunset,
+    Neon,
+    Ocean,
+    Sakura,
+    Mono,
+    Custom,
+}
+
+/// Resolved colours used for drawing, all 0xRRGGBB.
+#[derive(Clone, Copy, Debug)]
+pub struct Palette {
+    pub text: u32,
+    pub label: u32,
+    /// Visualizer / accent gradient: low pitch -> mid -> high pitch.
+    pub gradient: [u32; 3],
+    pub panel: u32,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 7] =
+        [Theme::Aurora, Theme::Sunset, Theme::Neon, Theme::Ocean, Theme::Sakura, Theme::Mono, Theme::Custom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Aurora => "オーロラ (シアン→紫→ピンク)",
+            Theme::Sunset => "サンセット (オレンジ→ピンク→紫)",
+            Theme::Neon => "ネオン (緑→シアン→青)",
+            Theme::Ocean => "オーシャン (青→水色→白)",
+            Theme::Sakura => "サクラ (ピンク→薄紫→白)",
+            Theme::Mono => "モノクロ",
+            Theme::Custom => "カスタム (自分で選んだ色)",
+        }
+    }
+
+    pub fn palette(self, cfg: &Config) -> Palette {
+        let p = |text, label, gradient, panel| Palette { text, label, gradient, panel };
+        match self {
+            Theme::Aurora => p(0xFFFFFF, 0xB8C4D6, [0x3DDCFF, 0x8B5CF6, 0xFF4FB8], 0x10131C),
+            Theme::Sunset => p(0xFFF7F0, 0xE0C2B4, [0xFFA53D, 0xFF4F8B, 0x9B4DFF], 0x1C1214),
+            Theme::Neon => p(0xF0FFF6, 0xA8D8C0, [0x39FF88, 0x22D3EE, 0x3B82F6], 0x0E1714),
+            Theme::Ocean => p(0xF2FAFF, 0xA9C3D9, [0x1E6BFF, 0x38BDF8, 0xE0F7FF], 0x0D1420),
+            Theme::Sakura => p(0xFFF5FA, 0xE3BFD2, [0xFF7EB6, 0xC4A1FF, 0xFFFFFF], 0x1E1419),
+            Theme::Mono => p(0xFFFFFF, 0xA0A0A0, [0x707070, 0xC8C8C8, 0xFFFFFF], 0x141414),
+            Theme::Custom => p(
+                cfg.text_color,
+                cfg.label_color,
+                [cfg.accent_color, cfg.accent_color_mid, cfg.accent_color_end],
+                cfg.panel_color,
+            ),
+        }
+    }
+}
+
+/// Shape of the audio visualizer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VizStyle {
+    Bars,
+    Mirror,
+    Wave,
+    Dots,
+}
+
+impl VizStyle {
+    pub const ALL: [VizStyle; 4] = [VizStyle::Bars, VizStyle::Mirror, VizStyle::Wave, VizStyle::Dots];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VizStyle::Bars => "バー",
+            VizStyle::Mirror => "ミラー (上下対称)",
+            VizStyle::Wave => "波形ライン",
+            VizStyle::Dots => "ドット",
+        }
+    }
+}
+
+/// Which colour the user is editing from the colour picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorSlot {
+    Text,
+    Label,
+    GradientStart,
+    GradientMid,
+    GradientEnd,
+    Panel,
+}
+
+impl ColorSlot {
+    pub const ALL: [ColorSlot; 6] = [
+        ColorSlot::Text,
+        ColorSlot::Label,
+        ColorSlot::GradientStart,
+        ColorSlot::GradientMid,
+        ColorSlot::GradientEnd,
+        ColorSlot::Panel,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorSlot::Text => "数値の文字色…",
+            ColorSlot::Label => "ラベルの文字色…",
+            ColorSlot::GradientStart => "グラデーション 開始色 (低音側)…",
+            ColorSlot::GradientMid => "グラデーション 中間色…",
+            ColorSlot::GradientEnd => "グラデーション 終了色 (高音側)…",
+            ColorSlot::Panel => "背景パネルの色…",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Anchor {
     /// Right edge of the overlay sits just left of the notification area.
@@ -161,18 +273,42 @@ pub struct Config {
     pub font_size: f32,
     /// Hide the overlay while a fullscreen app or game is in front.
     pub hide_in_fullscreen: bool,
-    /// Maximum characters shown for the media title.
-    pub media_max_chars: usize,
+    /// Width of the media title area in DIPs; longer titles scroll (marquee).
+    pub media_width: f32,
+    /// Scroll long media titles instead of cutting them off.
+    pub marquee: bool,
+    /// Show the album art / video thumbnail next to the title.
+    pub album_art: bool,
     /// Number of visualizer bars.
     pub visualizer_bars: usize,
     /// Visualizer sensitivity.
     pub visualizer_sensitivity: Sensitivity,
+    pub visualizer_style: VizStyle,
+    /// Small markers that hold each bar's recent peak and fall slowly.
+    pub peak_hold: bool,
+    /// Thin 60-second history graph behind each value.
+    pub sparklines: bool,
+    /// Colour values from green to yellow to red as they rise.
+    pub color_by_value: bool,
+    /// Numbers glide to new values (only in modes with animation).
+    pub smooth_numbers: bool,
+    /// Rounded translucent panel behind the strip.
+    pub panel: bool,
+    /// Panel opacity 0..1.
+    pub panel_opacity: f32,
+    pub theme: Theme,
     /// Text colour as 0xRRGGBB.
     pub text_color: u32,
     /// Label colour as 0xRRGGBB.
     pub label_color: u32,
-    /// Accent colour (visualizer, warnings) as 0xRRGGBB.
+    /// Custom theme: gradient start colour as 0xRRGGBB.
     pub accent_color: u32,
+    /// Custom theme: gradient middle colour.
+    pub accent_color_mid: u32,
+    /// Custom theme: gradient end colour.
+    pub accent_color_end: u32,
+    /// Custom theme: panel colour.
+    pub panel_color: u32,
 }
 
 impl Default for Config {
@@ -194,12 +330,25 @@ impl Default for Config {
             offset_x: 8,
             font_size: 13.0,
             hide_in_fullscreen: true,
-            media_max_chars: 28,
+            media_width: 180.0,
+            marquee: true,
+            album_art: true,
             visualizer_bars: 16,
             visualizer_sensitivity: Sensitivity::Auto,
+            visualizer_style: VizStyle::Bars,
+            peak_hold: true,
+            sparklines: true,
+            color_by_value: true,
+            smooth_numbers: true,
+            panel: true,
+            panel_opacity: 0.55,
+            theme: Theme::Aurora,
             text_color: 0xFFFFFF,
             label_color: 0xC8C8C8,
-            accent_color: 0x4FC3F7,
+            accent_color: 0x3DDCFF,
+            accent_color_mid: 0x8B5CF6,
+            accent_color_end: 0xFF4FB8,
+            panel_color: 0x10131C,
         }
     }
 }
@@ -227,6 +376,45 @@ impl Config {
         let _ = std::fs::create_dir_all(Self::dir());
         if let Ok(text) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(Self::path(), text);
+        }
+    }
+
+    pub fn palette(&self) -> Palette {
+        self.theme.palette(self)
+    }
+
+    pub fn color_slot(&self, slot: ColorSlot) -> u32 {
+        let p = self.palette();
+        match slot {
+            ColorSlot::Text => p.text,
+            ColorSlot::Label => p.label,
+            ColorSlot::GradientStart => p.gradient[0],
+            ColorSlot::GradientMid => p.gradient[1],
+            ColorSlot::GradientEnd => p.gradient[2],
+            ColorSlot::Panel => p.panel,
+        }
+    }
+
+    /// Sets one colour. The current theme's colours are copied into the custom
+    /// slots first, so editing one colour keeps the rest of the look.
+    pub fn set_color(&mut self, slot: ColorSlot, rgb: u32) {
+        if self.theme != Theme::Custom {
+            let p = self.palette();
+            self.text_color = p.text;
+            self.label_color = p.label;
+            self.accent_color = p.gradient[0];
+            self.accent_color_mid = p.gradient[1];
+            self.accent_color_end = p.gradient[2];
+            self.panel_color = p.panel;
+            self.theme = Theme::Custom;
+        }
+        match slot {
+            ColorSlot::Text => self.text_color = rgb,
+            ColorSlot::Label => self.label_color = rgb,
+            ColorSlot::GradientStart => self.accent_color = rgb,
+            ColorSlot::GradientMid => self.accent_color_mid = rgb,
+            ColorSlot::GradientEnd => self.accent_color_end = rgb,
+            ColorSlot::Panel => self.panel_color = rgb,
         }
     }
 

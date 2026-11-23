@@ -2,20 +2,45 @@
 //! Works with any app that integrates with the Windows media overlay
 //! (Spotify, browsers playing YouTube, Media Player, etc.).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use windows::core::GUID;
 use windows::Media::Control::{
+    GlobalSystemMediaTransportControlsSession as Session,
     GlobalSystemMediaTransportControlsSessionManager as Manager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
 };
+use windows::Win32::Graphics::Imaging::*;
+use windows::Win32::System::Com::{CoCreateInstance, IStream, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::WinRT::CreateStreamOverRandomAccessStream;
+
+/// Album art / thumbnail decoded to premultiplied BGRA, short side = ART_SIZE px.
+#[derive(Debug)]
+pub struct Art {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl PartialEq for Art {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+const ART_SIZE: u32 = 96;
+static NEXT_ART_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaInfo {
     pub title: String,
     pub artist: String,
     pub playing: bool,
+    pub art: Option<Arc<Art>>,
 }
 
 pub enum MediaCommand {
@@ -27,7 +52,42 @@ pub enum MediaCommand {
     Quit,
 }
 
-fn read(manager: &Manager) -> Option<MediaInfo> {
+fn decode_art(session: &Session) -> Option<Arc<Art>> {
+    let props = session.TryGetMediaPropertiesAsync().ok()?.join().ok()?;
+    let stream = props.Thumbnail().ok()?.OpenReadAsync().ok()?.join().ok()?;
+    unsafe {
+        let istream: IStream = CreateStreamOverRandomAccessStream(&stream).ok()?;
+        let wic: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let decoder = wic
+            .CreateDecoderFromStream(&istream, std::ptr::null::<GUID>(), WICDecodeMetadataCacheOnDemand)
+            .ok()?;
+        let frame = decoder.GetFrame(0).ok()?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h).ok()?;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // Scale so the short side is ART_SIZE; the renderer centre-crops to a square.
+        let short = w.min(h) as f32;
+        let (sw, sh) = (
+            ((w as f32 * ART_SIZE as f32 / short).round() as u32).max(1),
+            ((h as f32 * ART_SIZE as f32 / short).round() as u32).max(1),
+        );
+        let scaler = wic.CreateBitmapScaler().ok()?;
+        scaler.Initialize(&frame, sw, sh, WICBitmapInterpolationModeFant).ok()?;
+        let converter = wic.CreateFormatConverter().ok()?;
+        converter
+            .Initialize(&scaler, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)
+            .ok()?;
+        let stride = sw * 4;
+        let mut pixels = vec![0u8; (stride * sh) as usize];
+        converter.CopyPixels(std::ptr::null(), stride, &mut pixels).ok()?;
+        Some(Arc::new(Art { id: NEXT_ART_ID.fetch_add(1, Ordering::Relaxed), width: sw, height: sh, pixels }))
+    }
+}
+
+fn read(manager: &Manager, previous: &Option<MediaInfo>, attempts: &mut u32) -> Option<MediaInfo> {
     let session = manager.GetCurrentSession().ok()?;
     let props = session.TryGetMediaPropertiesAsync().ok()?.join().ok()?;
     let playing = session
@@ -39,11 +99,22 @@ fn read(manager: &Manager) -> Option<MediaInfo> {
     if title.is_empty() {
         return None;
     }
-    Some(MediaInfo {
-        title,
-        artist: props.Artist().map(|s| s.to_string()).unwrap_or_default(),
-        playing,
-    })
+    let artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
+    // Re-decode the thumbnail only when the track changes.
+    // Some sources never provide one, so give up after a few tries per track.
+    let same_track = matches!(previous, Some(p) if p.title == title && p.artist == artist);
+    if !same_track {
+        *attempts = 0;
+    }
+    let art = match previous {
+        Some(p) if same_track && p.art.is_some() => p.art.clone(),
+        _ if *attempts < 4 => {
+            *attempts += 1;
+            decode_art(&session)
+        }
+        _ => None,
+    };
+    Some(MediaInfo { title, artist, playing, art })
 }
 
 /// Runs on its own thread. Calls `changed` whenever the now-playing info changes.
@@ -57,17 +128,19 @@ pub fn run(
         Ok(m) => m,
         Err(_) => return, // SMTC unavailable (very old Windows 10 builds).
     };
+    let mut last: Option<MediaInfo> = None;
+    let mut attempts = 0u32;
     loop {
-        let info = read(&manager);
-        {
-            let mut guard = shared.lock().unwrap();
-            if *guard != info {
-                *guard = info;
-                drop(guard);
-                changed();
-            }
+        let info = read(&manager, &last, &mut attempts);
+        // Thumbnails often arrive a moment after the title: retry soon while missing.
+        let retry_art = matches!(&info, Some(i) if i.art.is_none()) && attempts < 4;
+        if info != last {
+            last = info.clone();
+            *shared.lock().unwrap() = info;
+            changed();
         }
-        match commands.recv_timeout(Duration::from_millis(interval_ms as u64)) {
+        let wait = if retry_art { interval_ms.min(1500) } else { interval_ms };
+        match commands.recv_timeout(Duration::from_millis(wait as u64)) {
             Ok(MediaCommand::Quit) | Err(RecvTimeoutError::Disconnected) => return,
             Ok(MediaCommand::Interval(ms)) => interval_ms = ms,
             Ok(cmd) => {

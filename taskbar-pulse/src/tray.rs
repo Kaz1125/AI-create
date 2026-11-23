@@ -7,7 +7,8 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{Anchor, Config, Item, Mode, Sensitivity};
+use crate::config::{Anchor, ColorSlot, Config, Item, Mode, Sensitivity, Theme, VizStyle};
+use windows::Win32::UI::Controls::Dialogs::*;
 use crate::WM_APP_TRAY;
 
 const ID_ITEM: u16 = 100;
@@ -20,6 +21,64 @@ const ID_FULLSCREEN: u16 = 320;
 const ID_AUTOSTART: u16 = 330;
 const ID_OPEN_CONFIG: u16 = 340;
 const ID_EXIT: u16 = 399;
+const ID_THEME: u16 = 400;
+const ID_STYLE: u16 = 420;
+const ID_FLAG: u16 = 440;
+const ID_OPACITY: u16 = 460;
+const ID_COLOR: u16 = 480;
+const OPACITIES: [(f32, &str); 3] = [(0.35, "薄い"), (0.55, "普通"), (0.8, "濃い")];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Flag {
+    PeakHold,
+    Sparklines,
+    ColorByValue,
+    SmoothNumbers,
+    Panel,
+    AlbumArt,
+    Marquee,
+}
+
+const FLAGS: [Flag; 7] = [
+    Flag::PeakHold,
+    Flag::Sparklines,
+    Flag::ColorByValue,
+    Flag::SmoothNumbers,
+    Flag::Panel,
+    Flag::AlbumArt,
+    Flag::Marquee,
+];
+
+impl Flag {
+    fn label(self) -> &'static str {
+        match self {
+            Flag::PeakHold => "ピークホールド",
+            Flag::Sparklines => "ミニ履歴グラフ (約60秒)",
+            Flag::ColorByValue => "値に応じて色を変える (緑→黄→赤)",
+            Flag::SmoothNumbers => "数値をなめらかに変化",
+            Flag::Panel => "背景パネル (すりガラス風)",
+            Flag::AlbumArt => "アルバムアートを表示",
+            Flag::Marquee => "長い曲名をスクロール",
+        }
+    }
+
+    fn get(self, c: &Config) -> bool {
+        match self {
+            Flag::PeakHold => c.peak_hold,
+            Flag::Sparklines => c.sparklines,
+            Flag::ColorByValue => c.color_by_value,
+            Flag::SmoothNumbers => c.smooth_numbers,
+            Flag::Panel => c.panel,
+            Flag::AlbumArt => c.album_art,
+            Flag::Marquee => c.marquee,
+        }
+    }
+
+    /// Effects that need animation frames, which low-load modes do not have.
+    fn needs_animation(self) -> bool {
+        matches!(self, Flag::PeakHold | Flag::SmoothNumbers | Flag::Marquee)
+    }
+}
 const FONT_SIZES: [(f32, &str); 3] = [(11.0, "小"), (13.0, "中"), (15.0, "大")];
 
 pub enum Action {
@@ -28,6 +87,11 @@ pub enum Action {
     SetAnchor(Anchor),
     FontSize(f32),
     SetSensitivity(Sensitivity),
+    SetTheme(Theme),
+    SetVizStyle(VizStyle),
+    Toggle(Flag),
+    PanelOpacity(f32),
+    PickColor(ColorSlot),
     ToggleFullscreenHide,
     ToggleAutostart,
     OpenConfig,
@@ -50,6 +114,19 @@ pub fn decode(id: u16) -> Action {
         }
         i if (ID_SENS..ID_SENS + Sensitivity::ALL.len() as u16).contains(&i) => {
             Action::SetSensitivity(Sensitivity::ALL[(i - ID_SENS) as usize])
+        }
+        i if (ID_THEME..ID_THEME + Theme::ALL.len() as u16).contains(&i) => {
+            Action::SetTheme(Theme::ALL[(i - ID_THEME) as usize])
+        }
+        i if (ID_STYLE..ID_STYLE + VizStyle::ALL.len() as u16).contains(&i) => {
+            Action::SetVizStyle(VizStyle::ALL[(i - ID_STYLE) as usize])
+        }
+        i if (ID_FLAG..ID_FLAG + FLAGS.len() as u16).contains(&i) => Action::Toggle(FLAGS[(i - ID_FLAG) as usize]),
+        i if (ID_OPACITY..ID_OPACITY + OPACITIES.len() as u16).contains(&i) => {
+            Action::PanelOpacity(OPACITIES[(i - ID_OPACITY) as usize].0)
+        }
+        i if (ID_COLOR..ID_COLOR + ColorSlot::ALL.len() as u16).contains(&i) => {
+            Action::PickColor(ColorSlot::ALL[(i - ID_COLOR) as usize])
         }
         ID_FULLSCREEN => Action::ToggleFullscreenHide,
         ID_AUTOSTART => Action::ToggleAutostart,
@@ -157,6 +234,51 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
         append(modes, MF_STRING | MF_GRAYED, 0, status);
         append(menu, MF_POPUP, modes.0 as usize, "動作モード");
 
+        // Colours
+        let colors = CreatePopupMenu().unwrap_or_default();
+        for (i, t) in Theme::ALL.iter().enumerate() {
+            append(colors, MF_STRING | check(cfg.theme == *t), (ID_THEME + i as u16) as usize, t.label());
+        }
+        append(colors, MF_SEPARATOR, 0, "");
+        for (i, slot) in ColorSlot::ALL.iter().enumerate() {
+            append(colors, MF_STRING, (ID_COLOR + i as u16) as usize, slot.label());
+        }
+        append(colors, MF_SEPARATOR, 0, "");
+        let flag_index = |f: Flag| FLAGS.iter().position(|x| *x == f).unwrap() as u16;
+        append(
+            colors,
+            MF_STRING | check(cfg.color_by_value),
+            (ID_FLAG + flag_index(Flag::ColorByValue)) as usize,
+            Flag::ColorByValue.label(),
+        );
+        append(menu, MF_POPUP, colors.0 as usize, "カラー");
+
+        // Look & effects
+        let look = CreatePopupMenu().unwrap_or_default();
+        let styles = CreatePopupMenu().unwrap_or_default();
+        for (i, st) in VizStyle::ALL.iter().enumerate() {
+            append(styles, MF_STRING | check(cfg.visualizer_style == *st), (ID_STYLE + i as u16) as usize, st.label());
+        }
+        append(look, MF_POPUP, styles.0 as usize, "ビジュアライザーの形");
+        let animated = cfg.mode.visualizer_interval_ms().is_some();
+        for f in FLAGS {
+            if f == Flag::ColorByValue {
+                continue;
+            }
+            let mut label = f.label().to_string();
+            if f.needs_animation() && !animated {
+                label += " (標準/高負荷モードで有効)";
+            }
+            append(look, MF_STRING | check(f.get(cfg)), (ID_FLAG + flag_index(f)) as usize, &label);
+        }
+        let opacity = CreatePopupMenu().unwrap_or_default();
+        for (i, (o, name)) in OPACITIES.iter().enumerate() {
+            let on = cfg.panel && (cfg.panel_opacity - o).abs() < 0.01;
+            append(opacity, MF_STRING | check(on), (ID_OPACITY + i as u16) as usize, name);
+        }
+        append(look, MF_POPUP, opacity.0 as usize, "背景パネルの濃さ");
+        append(menu, MF_POPUP, look.0 as usize, "見た目・エフェクト");
+
         let pos = CreatePopupMenu().unwrap_or_default();
         append(pos, MF_STRING | check(cfg.anchor == Anchor::BesideTray), ID_ANCHOR_TRAY as usize, "通知領域の左 (位置リセット)");
         append(pos, MF_STRING | check(cfg.anchor == Anchor::Left), ID_ANCHOR_LEFT as usize, "タスクバーの左端 (位置リセット)");
@@ -216,5 +338,28 @@ pub fn set_autostart(enable: bool) {
             let _ = RegDeleteValueW(key, RUN_NAME);
         }
         let _ = RegCloseKey(key);
+    }
+}
+
+/// Opens the standard Windows colour picker. Returns 0xRRGGBB, or None if cancelled.
+pub fn pick_color(owner: HWND, current: u32) -> Option<u32> {
+    // COLORREF is 0x00BBGGRR.
+    let to_ref = |rgb: u32| COLORREF(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF));
+    let mut custom = [COLORREF(0x00FFFFFF); 16];
+    let mut cc = CHOOSECOLORW {
+        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: owner,
+        rgbResult: to_ref(current),
+        lpCustColors: custom.as_mut_ptr(),
+        Flags: CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR,
+        ..Default::default()
+    };
+    unsafe {
+        if ChooseColorW(&mut cc).as_bool() {
+            let c = cc.rgbResult.0;
+            Some(((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF))
+        } else {
+            None
+        }
     }
 }

@@ -2,6 +2,7 @@
 //! on the Windows taskbar.
 #![windows_subsystem = "windows"]
 
+mod anim;
 mod audio;
 mod config;
 mod media;
@@ -13,7 +14,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -33,7 +34,7 @@ use sensors::Snapshot;
 pub const WM_APP_SENSORS: u32 = WM_APP + 1;
 pub const WM_APP_MEDIA: u32 = WM_APP + 2;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
-const TIMER_VISUALIZER: usize = 1;
+const TIMER_ANIM: usize = 1;
 const TIMER_POSITION: usize = 2;
 
 pub fn battery_kind_glyph(kind: DeviceKind) -> char {
@@ -57,7 +58,10 @@ struct App {
     sensor_interval: Arc<AtomicU32>,
     want_devices: Arc<AtomicBool>,
     hybrid: bool,
-    last_viz_zero: bool,
+    visual: anim::Visual,
+    last_frame: Instant,
+    /// The previous animation frame changed nothing on screen.
+    anim_idle: bool,
     hidden_for_fullscreen: bool,
     /// Drag state: (cursor x at press, offset at press, moved?)
     drag: Option<(i32, i32, bool)>,
@@ -129,10 +133,10 @@ impl App {
         }
 
         let Some(p) = placement() else { return };
-        let snap = self.snapshot.lock().unwrap().clone();
         let media = self.media.lock().unwrap().clone();
         let viz = self.visualizer_active().then(|| self.visualizer.snapshot());
-        let segs = render::build_segments(&self.config, &snap, media.as_ref(), viz);
+        let peaks = (self.config.peak_hold && viz.is_some()).then(|| self.visual.peaks.clone());
+        let segs = render::build_segments(&self.config, &self.visual, media.as_ref(), viz, peaks);
         let height = p.taskbar.bottom - p.taskbar.top;
         if height <= 0 {
             return;
@@ -150,6 +154,38 @@ impl App {
         }
     }
 
+    fn smoothing(&self) -> bool {
+        self.config.smooth_numbers && self.config.mode.visualizer_interval_ms().is_some()
+    }
+
+    fn on_sensors(&mut self) {
+        let snap = self.snapshot.lock().unwrap().clone();
+        let smooth = self.smoothing();
+        self.visual.on_sensors(snap, smooth);
+        self.redraw();
+        self.keep_on_top();
+    }
+
+    fn animate(&mut self) {
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+        let moving = self.smoothing() && self.visual.tick(dt);
+        let mut busy = moving || self.renderer.marquee_active;
+        if self.visualizer_active() {
+            let bars = self.visualizer.snapshot();
+            busy |= bars.iter().any(|v| *v > 0.005);
+            if self.config.peak_hold {
+                busy |= self.visual.update_peaks(&bars, dt);
+            }
+        }
+        // Skip frames while nothing moves; draw one more frame after motion stops.
+        if busy || !self.anim_idle {
+            self.redraw();
+        }
+        self.anim_idle = !busy;
+    }
+
     fn visualizer_active(&self) -> bool {
         self.config.has(Item::Visualizer) && self.config.mode.visualizer_interval_ms().is_some()
     }
@@ -165,12 +201,19 @@ impl App {
         self.visualizer.sensitivity.store(self.config.visualizer_sensitivity.code(), Ordering::Relaxed);
         let viz = self.visualizer_active();
         self.visualizer.enabled.store(viz, Ordering::Relaxed);
+        self.visual.set_history_len(mode.sensor_interval_ms());
+        // One animation timer drives the visualizer, peak markers, scrolling titles and
+        // number easing. Low-load modes have no animation at all.
+        let wants_anim = viz
+            || self.config.has(Item::Media)
+            || self.config.smooth_numbers;
         unsafe {
-            let _ = KillTimer(Some(self.hwnd), TIMER_VISUALIZER);
-            if let Some(ms) = mode.visualizer_interval_ms().filter(|_| viz) {
-                SetTimer(Some(self.hwnd), TIMER_VISUALIZER, ms, None);
+            let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
+            if let Some(ms) = mode.visualizer_interval_ms().filter(|_| wants_anim) {
+                SetTimer(Some(self.hwnd), TIMER_ANIM, ms, None);
             }
         }
+        self.last_frame = Instant::now();
         self.config.save();
         self.redraw();
     }
@@ -196,23 +239,17 @@ fn lparam_x(lparam: LPARAM) -> i32 {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        WM_APP_SENSORS | WM_APP_MEDIA => {
-            with_app(|app| {
-                app.redraw();
-                app.keep_on_top();
-            });
+        WM_APP_SENSORS => {
+            with_app(|app| app.on_sensors());
+            LRESULT(0)
+        }
+        WM_APP_MEDIA => {
+            with_app(|app| app.redraw());
             LRESULT(0)
         }
         WM_TIMER => {
             with_app(|app| match wparam.0 {
-                TIMER_VISUALIZER => {
-                    // Skip frames while silent to save CPU/GPU.
-                    let zero = app.visualizer.snapshot().iter().all(|v| *v < 0.005);
-                    if !(zero && app.last_viz_zero) {
-                        app.redraw();
-                    }
-                    app.last_viz_zero = zero;
-                }
+                TIMER_ANIM => app.animate(),
                 TIMER_POSITION => app.keep_on_top(),
                 _ => {}
             });
@@ -350,6 +387,50 @@ fn handle_command(hwnd: HWND, id: u16) {
                 app.apply_config();
             });
         }
+        tray::Action::SetTheme(theme) => {
+            with_app(|app| {
+                app.config.theme = theme;
+                app.apply_config();
+            });
+        }
+        tray::Action::SetVizStyle(style) => {
+            with_app(|app| {
+                app.config.visualizer_style = style;
+                app.apply_config();
+            });
+        }
+        tray::Action::Toggle(flag) => {
+            with_app(|app| {
+                let c = &mut app.config;
+                let v = match flag {
+                    tray::Flag::PeakHold => &mut c.peak_hold,
+                    tray::Flag::Sparklines => &mut c.sparklines,
+                    tray::Flag::ColorByValue => &mut c.color_by_value,
+                    tray::Flag::SmoothNumbers => &mut c.smooth_numbers,
+                    tray::Flag::Panel => &mut c.panel,
+                    tray::Flag::AlbumArt => &mut c.album_art,
+                    tray::Flag::Marquee => &mut c.marquee,
+                };
+                *v = !*v;
+                app.apply_config();
+            });
+        }
+        tray::Action::PanelOpacity(o) => {
+            with_app(|app| {
+                app.config.panel_opacity = o;
+                app.config.panel = true;
+                app.apply_config();
+            });
+        }
+        tray::Action::PickColor(slot) => {
+            let Some(current) = with_app(|app| app.config.color_slot(slot)) else { return };
+            if let Some(rgb) = tray::pick_color(hwnd, current) {
+                with_app(|app| {
+                    app.config.set_color(slot, rgb);
+                    app.apply_config();
+                });
+            }
+        }
         tray::Action::ToggleFullscreenHide => {
             with_app(|app| {
                 app.config.hide_in_fullscreen = !app.config.hide_in_fullscreen;
@@ -480,7 +561,9 @@ fn main() -> windows::core::Result<()> {
             sensor_interval,
             want_devices,
             hybrid,
-            last_viz_zero: false,
+            visual: anim::Visual::new(),
+            last_frame: Instant::now(),
+            anim_idle: false,
             hidden_for_fullscreen: false,
             drag: None,
             taskbar_created_msg: RegisterWindowMessageW(w!("TaskbarCreated")),
