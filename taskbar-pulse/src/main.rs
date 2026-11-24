@@ -176,7 +176,7 @@ impl App {
     }
 
     fn smoothing(&self) -> bool {
-        self.config.smooth_numbers && self.config.mode.visualizer_interval_ms().is_some()
+        self.config.smooth_numbers && self.config.animated()
     }
 
     fn on_sensors(&mut self) {
@@ -223,21 +223,20 @@ impl App {
     }
 
     fn visualizer_active(&self) -> bool {
-        self.config.has(Item::Visualizer) && self.config.mode.visualizer_interval_ms().is_some()
+        self.config.has(Item::Visualizer) && self.config.animated()
     }
 
     /// Applies mode/item changes to the worker threads and timers.
     fn apply_config(&mut self) {
-        let mode = self.config.mode;
-        self.sensor_interval.store(mode.sensor_interval_ms(), Ordering::Relaxed);
+        self.sensor_interval.store(self.config.sensor_ms(), Ordering::Relaxed);
         self.want_devices.store(self.config.has(Item::Devices), Ordering::Relaxed);
-        self.renderer.set_hardware(mode.hardware_rendering());
-        let _ = self.media_tx.send(MediaCommand::Interval(mode.sensor_interval_ms().max(1000)));
+        self.renderer.set_hardware(self.config.hardware());
+        let _ = self.media_tx.send(MediaCommand::Interval(self.config.sensor_ms().clamp(1000, 5000)));
         self.visualizer.bar_count.store(self.config.visualizer_bars, Ordering::Relaxed);
         self.visualizer.sensitivity.store(self.config.visualizer_sensitivity.code(), Ordering::Relaxed);
         let viz = self.visualizer_active();
         self.visualizer.enabled.store(viz, Ordering::Relaxed);
-        self.visual.set_history_len(mode.sensor_interval_ms());
+        self.visual.set_history_len(self.config.sensor_ms());
         // One animation timer drives the visualizer, peak markers, scrolling titles and
         // number easing. Low-load modes have no animation at all.
         let wants_anim = viz
@@ -246,7 +245,7 @@ impl App {
             || self.config.smooth_numbers;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
-            if let Some(ms) = mode.visualizer_interval_ms().filter(|_| wants_anim) {
+            if let Some(ms) = self.config.frame_ms().filter(|_| wants_anim) {
                 SetTimer(Some(self.hwnd), TIMER_ANIM, ms, None);
             }
         }
@@ -520,6 +519,24 @@ fn handle_command(hwnd: HWND, id: u16) {
                 app.apply_config();
             });
         }
+        tray::Action::SetSensorOverride(v) => {
+            with_app(|app| {
+                app.config.sensor_interval_override_ms = v;
+                app.apply_config();
+            });
+        }
+        tray::Action::SetFpsOverride(v) => {
+            with_app(|app| {
+                app.config.fps_override = v;
+                app.apply_config();
+            });
+        }
+        tray::Action::SetRender(r) => {
+            with_app(|app| {
+                app.config.render = r;
+                app.apply_config();
+            });
+        }
         tray::Action::ToggleFullscreenHide => {
             with_app(|app| {
                 app.config.hide_in_fullscreen = !app.config.hide_in_fullscreen;
@@ -594,7 +611,7 @@ fn main() -> windows::core::Result<()> {
 
         // --- Worker threads ---
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
-        let sensor_interval = Arc::new(AtomicU32::new(config.mode.sensor_interval_ms()));
+        let sensor_interval = Arc::new(AtomicU32::new(config.sensor_ms()));
         let want_devices = Arc::new(AtomicBool::new(config.has(Item::Devices)));
         let hwnd_raw = hwnd.0 as isize;
         let (hybrid_tx, hybrid_rx) = channel();
@@ -622,7 +639,7 @@ fn main() -> windows::core::Result<()> {
         let (media_tx, media_rx) = channel();
         {
             let shared = media_state.clone();
-            let interval = config.mode.sensor_interval_ms().max(1000);
+            let interval = config.sensor_ms().clamp(1000, 5000);
             std::thread::Builder::new()
                 .name("media".into())
                 .spawn(move || {
@@ -634,7 +651,7 @@ fn main() -> windows::core::Result<()> {
                 .expect("spawn media thread");
         }
 
-        let viz_on = config.has(Item::Visualizer) && config.mode.visualizer_interval_ms().is_some();
+        let viz_on = config.has(Item::Visualizer) && config.animated();
         let visualizer =
             audio::Visualizer::start(config.visualizer_bars, viz_on, config.visualizer_sensitivity.code());
         let hybrid = hybrid_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false);

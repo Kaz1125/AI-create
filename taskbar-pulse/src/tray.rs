@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{Anchor, Character, ColorSlot, Config, Item, Mode, Sensitivity, Theme, VizStyle};
+use crate::config::{Anchor, Character, RenderChoice, ColorSlot, Config, Item, Mode, Sensitivity, Theme, VizStyle};
 use windows::Win32::UI::Controls::Dialogs::*;
 use crate::WM_APP_TRAY;
 
@@ -31,6 +31,16 @@ const ID_PICK_IMAGE: u16 = 510;
 const ID_MASCOT_SPEED: u16 = 511;
 const ID_MONITOR_PRIMARY: u16 = 520;
 const ID_MONITOR: u16 = 521;
+const ID_SENSOR: u16 = 540;
+const ID_FPS: u16 = 560;
+const ID_RENDER: u16 = 580;
+/// Sensor interval presets in ms (None = follow the mode).
+const SENSOR_PRESETS: [Option<u32>; 10] =
+    [None, Some(250), Some(500), Some(1000), Some(1500), Some(2000), Some(3000), Some(5000), Some(10_000), Some(30_000)];
+/// Frame rate presets (None = follow the mode, 0 = no animation).
+const FPS_PRESETS: [Option<u32>; 13] =
+    [None, Some(0), Some(5), Some(10), Some(15), Some(20), Some(24), Some(30), Some(45), Some(60), Some(90), Some(120), Some(144)];
+const RENDERS: [RenderChoice; 3] = [RenderChoice::Auto, RenderChoice::Cpu, RenderChoice::Gpu];
 const OPACITIES: [(f32, &str); 3] = [(0.35, "薄い"), (0.55, "普通"), (0.8, "濃い")];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,6 +112,9 @@ pub enum Action {
     ToggleMascotSpeed,
     /// None = primary monitor.
     SetMonitor(Option<String>),
+    SetSensorOverride(Option<u32>),
+    SetFpsOverride(Option<u32>),
+    SetRender(RenderChoice),
     ToggleFullscreenHide,
     ToggleAutostart,
     OpenConfig,
@@ -148,6 +161,13 @@ pub fn decode(id: u16) -> Action {
             Some(m) => Action::SetMonitor(Some(m.name.clone())),
             None => Action::None,
         },
+        i if (ID_SENSOR..ID_SENSOR + SENSOR_PRESETS.len() as u16).contains(&i) => {
+            Action::SetSensorOverride(SENSOR_PRESETS[(i - ID_SENSOR) as usize])
+        }
+        i if (ID_FPS..ID_FPS + FPS_PRESETS.len() as u16).contains(&i) => {
+            Action::SetFpsOverride(FPS_PRESETS[(i - ID_FPS) as usize])
+        }
+        i if (ID_RENDER..ID_RENDER + RENDERS.len() as u16).contains(&i) => Action::SetRender(RENDERS[(i - ID_RENDER) as usize]),
         ID_FULLSCREEN => Action::ToggleFullscreenHide,
         ID_AUTOSTART => Action::ToggleAutostart,
         ID_OPEN_CONFIG => Action::OpenConfig,
@@ -238,7 +258,7 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
                 flags |= MF_GRAYED;
                 label += " (このCPUは非対応)";
             }
-            if *item == Item::Visualizer && cfg.mode.visualizer_interval_ms().is_none() {
+            if *item == Item::Visualizer && !cfg.animated() {
                 label += " (標準/高負荷モードで有効)";
             }
             append(items, flags, (ID_ITEM + i as u16) as usize, &label);
@@ -252,7 +272,66 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
         append(modes, MF_SEPARATOR, 0, "");
         let status = if hardware_active { "現在の描画: GPU" } else { "現在の描画: CPU" };
         append(modes, MF_STRING | MF_GRAYED, 0, status);
+        if cfg.sensor_interval_override_ms.is_some() || cfg.fps_override.is_some() || cfg.render != RenderChoice::Auto {
+            append(modes, MF_STRING | MF_GRAYED, 0, "※ 詳細オプションの設定が優先されています");
+        }
         append(menu, MF_POPUP, modes.0 as usize, "動作モード");
+
+        // Advanced options
+        let adv = CreatePopupMenu().unwrap_or_default();
+        let secs = |ms: u32| {
+            if ms % 1000 == 0 {
+                format!("{}秒", ms / 1000)
+            } else {
+                format!("{}秒", ms as f32 / 1000.0)
+            }
+        };
+        let sensor = CreatePopupMenu().unwrap_or_default();
+        for (i, p) in SENSOR_PRESETS.iter().enumerate() {
+            let label = match p {
+                None => format!("自動 (モードに従う: {})", secs(cfg.mode.sensor_interval_ms())),
+                Some(ms) => secs(*ms),
+            };
+            append(sensor, MF_STRING | check(cfg.sensor_interval_override_ms == *p), (ID_SENSOR + i as u16) as usize, &label);
+        }
+        if let Some(ms) = cfg.sensor_interval_override_ms.filter(|v| !SENSOR_PRESETS.contains(&Some(*v))) {
+            append(sensor, MF_STRING | MF_GRAYED | MF_CHECKED, 0, &format!("{} (設定ファイルで指定)", secs(ms.clamp(100, 60_000))));
+        }
+        append(adv, MF_POPUP, sensor.0 as usize, &format!("センサー取得間隔 (現在 {})", secs(cfg.sensor_ms())));
+
+        let fps = CreatePopupMenu().unwrap_or_default();
+        for (i, p) in FPS_PRESETS.iter().enumerate() {
+            let label = match p {
+                None => {
+                    let m = cfg.mode.visualizer_interval_ms().map(|ms| (1000 + ms / 2) / ms).unwrap_or(0);
+                    format!("自動 (モードに従う: {} fps)", m)
+                }
+                Some(0) => "0 (アニメーションなし)".to_string(),
+                Some(f) if *f > 60 => format!("{f} fps (※実際は約60fpsが上限の場合あり)"),
+                Some(f) => format!("{f} fps"),
+            };
+            append(fps, MF_STRING | check(cfg.fps_override == *p), (ID_FPS + i as u16) as usize, &label);
+        }
+        if let Some(f) = cfg.fps_override.filter(|v| !FPS_PRESETS.contains(&Some(*v))) {
+            append(fps, MF_STRING | MF_GRAYED | MF_CHECKED, 0, &format!("{} fps (設定ファイルで指定)", f.min(240)));
+        }
+        append(adv, MF_POPUP, fps.0 as usize, &format!("描画FPS (現在 {} fps)", cfg.fps()));
+
+        let render = CreatePopupMenu().unwrap_or_default();
+        for (i, r) in RENDERS.iter().enumerate() {
+            let label = match r {
+                RenderChoice::Auto => "自動 (モードに従う)",
+                RenderChoice::Cpu => "CPU描画 (GPUを使わない)",
+                RenderChoice::Gpu => "GPU描画",
+            };
+            append(render, MF_STRING | check(cfg.render == *r), (ID_RENDER + i as u16) as usize, label);
+        }
+        append(render, MF_SEPARATOR, 0, "");
+        append(render, MF_STRING | MF_GRAYED, 0, if hardware_active { "現在の描画: GPU" } else { "現在の描画: CPU" });
+        append(adv, MF_POPUP, render.0 as usize, "描画方式");
+        append(adv, MF_SEPARATOR, 0, "");
+        append(adv, MF_STRING | MF_GRAYED, 0, "細かい値は設定ファイルでも指定できます");
+        append(menu, MF_POPUP, adv.0 as usize, "詳細オプション");
 
         // Colours
         let colors = CreatePopupMenu().unwrap_or_default();
@@ -280,7 +359,7 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
             append(styles, MF_STRING | check(cfg.visualizer_style == *st), (ID_STYLE + i as u16) as usize, st.label());
         }
         append(look, MF_POPUP, styles.0 as usize, "ビジュアライザーの形");
-        let animated = cfg.mode.visualizer_interval_ms().is_some();
+        let animated = cfg.animated();
         for f in FLAGS {
             if f == Flag::ColorByValue {
                 continue;
@@ -315,7 +394,7 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
         append(mascot, MF_STRING | check(shown && cfg.mascot == Character::Image), ID_PICK_IMAGE as usize, &image_label);
         append(mascot, MF_SEPARATOR, 0, "");
         append(mascot, MF_STRING | check(cfg.mascot_cpu_speed), ID_MASCOT_SPEED as usize, "CPU負荷で動きが速くなる");
-        if cfg.mode.visualizer_interval_ms().is_none() {
+        if !cfg.animated() {
             append(mascot, MF_STRING | MF_GRAYED, 0, "※ 低負荷モードでは止まった表示になります");
         }
         append(menu, MF_POPUP, mascot.0 as usize, "ミニキャラ / GIF");

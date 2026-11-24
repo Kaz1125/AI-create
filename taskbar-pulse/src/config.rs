@@ -282,6 +282,15 @@ impl ColorSlot {
     }
 }
 
+/// Rasterizer choice in the advanced options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenderChoice {
+    /// Follow the mode (GPU in Standard/High, CPU in the low-load modes).
+    Auto,
+    Cpu,
+    Gpu,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Anchor {
     /// Right edge of the overlay sits just left of the notification area.
@@ -295,6 +304,12 @@ pub enum Anchor {
 pub struct Config {
     pub items: Vec<Item>,
     pub mode: Mode,
+    /// Advanced: sensor interval override in ms (100-60000). None = follow the mode.
+    pub sensor_interval_override_ms: Option<u32>,
+    /// Advanced: animation frame rate override (0 = no animation, max 240). None = follow the mode.
+    pub fps_override: Option<u32>,
+    /// Advanced: CPU or GPU drawing.
+    pub render: RenderChoice,
     pub anchor: Anchor,
     /// Extra horizontal offset in pixels (positive moves left for BesideTray, right for Left).
     pub offset_x: i32,
@@ -362,6 +377,9 @@ impl Default for Config {
                 Item::Visualizer,
             ],
             mode: Mode::Standard,
+            sensor_interval_override_ms: None,
+            fps_override: None,
+            render: RenderChoice::Auto,
             anchor: Anchor::BesideTray,
             offset_x: 8,
             font_size: 13.0,
@@ -417,6 +435,39 @@ impl Config {
         if let Ok(text) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(Self::path(), text);
         }
+    }
+
+    /// Effective sensor interval (advanced override, else the mode's value).
+    pub fn sensor_ms(&self) -> u32 {
+        self.sensor_interval_override_ms
+            .map(|v| v.clamp(100, 60_000))
+            .unwrap_or_else(|| self.mode.sensor_interval_ms())
+    }
+
+    /// Effective animation frame interval in ms; None = no animation.
+    pub fn frame_ms(&self) -> Option<u32> {
+        match self.fps_override {
+            Some(0) => None,
+            Some(fps) => Some((1000 / fps.clamp(1, 240)).max(1)),
+            None => self.mode.visualizer_interval_ms(),
+        }
+    }
+
+    /// Effective frame rate for display in the menu.
+    pub fn fps(&self) -> u32 {
+        self.frame_ms().map(|ms| (1000 + ms / 2) / ms).unwrap_or(0)
+    }
+
+    pub fn hardware(&self) -> bool {
+        match self.render {
+            RenderChoice::Auto => self.mode.hardware_rendering(),
+            RenderChoice::Cpu => false,
+            RenderChoice::Gpu => true,
+        }
+    }
+
+    pub fn animated(&self) -> bool {
+        self.frame_ms().is_some()
     }
 
     pub fn palette(&self) -> Palette {
