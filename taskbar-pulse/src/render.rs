@@ -66,7 +66,7 @@ pub struct Renderer {
     /// Mascot image frames uploaded to the current render target, keyed by Animation::id.
     gif_cache: Option<(u64, Vec<Option<ID2D1Bitmap>>)>,
     started: Instant,
-    /// Horizontal range of the media segment in window pixels (for click handling).
+    /// Horizontal range of the play/pause mark in window pixels (for click handling).
     pub media_hit: Option<(f32, f32)>,
     /// True when the last frame had a scrolling title (needs animation frames).
     pub marquee_active: bool,
@@ -402,7 +402,6 @@ impl Renderer {
                     }
                     Segment::Media { playing, text: t, art } => {
                         self.draw_media(&target, x, seg_w, h, scale, cfg, &pal, *playing, t, art.as_deref(), time)?;
-                        self.media_hit = Some((x, x + seg_w));
                     }
                     Segment::Visualizer { bars, peaks } => {
                         self.draw_visualizer(&target, x, seg_w, h, scale, cfg.visualizer_style, &pal, bars, peaks.as_deref())?;
@@ -685,6 +684,8 @@ impl Renderer {
         let (lay, iw, ih) = self.layout(glyph, self.icon_fmt.as_ref().unwrap())?;
         let icon = target.CreateSolidColorBrush(&color(pal.gradient[0], 1.0), None)?;
         target.DrawTextLayout(pt(cx, (h - ih) / 2.0), &lay, &icon, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        // Only the play/pause mark is clickable (a couple of pixels of slack for easier aim).
+        self.media_hit = Some((cx - 2.0 * scale, cx + iw + 2.0 * scale));
         cx += iw + 5.0 * scale;
 
         let (lay, tw, th) = self.layout(text, self.label_fmt.as_ref().unwrap())?;
