@@ -281,8 +281,9 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
 
         // Display order: one submenu per shown item, left to right.
         let order = CreatePopupMenu().unwrap_or_default();
-        let count = cfg.items.len();
-        for (idx, item) in cfg.items.iter().enumerate() {
+        let shown = cfg.shown();
+        let count = shown.len();
+        for (idx, item) in shown.iter().enumerate() {
             let sub = CreatePopupMenu().unwrap_or_default();
             let base = ID_ORDER + idx as u16 * 4;
             let first = idx == 0;

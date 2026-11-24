@@ -311,7 +311,11 @@ pub enum Anchor {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Items that are shown (order here does not matter; see `order`).
     pub items: Vec<Item>,
+    /// Left-to-right order of every item, shown or not, so an item hidden and shown
+    /// again returns to its previous place.
+    pub order: Vec<Item>,
     pub mode: Mode,
     /// Advanced: sensor interval override in ms (100-60000). None = follow the mode.
     pub sensor_interval_override_ms: Option<u32>,
@@ -377,6 +381,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            order: Vec::new(),
             items: vec![
                 Item::Devices,
                 Item::CpuTemp,
@@ -441,6 +446,7 @@ impl Config {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => Config::default(),
         }
+        .normalized()
     }
 
     pub fn save(&self) {
@@ -526,8 +532,26 @@ impl Config {
         self.items.contains(&item)
     }
 
-    /// Shows or hides an item. Newly shown items are added at the right end;
-    /// `items` is also the display order (left to right).
+    /// Makes `order` contain every item exactly once. Older configs had no `order`;
+    /// their `items` list was the display order, so it is used as the starting point.
+    pub fn normalized(mut self) -> Config {
+        let mut order: Vec<Item> = Vec::new();
+        for item in self.order.iter().chain(self.items.iter()).chain(Item::ALL.iter()) {
+            if !order.contains(item) {
+                order.push(*item);
+            }
+        }
+        self.order = order;
+        self.items.dedup();
+        self
+    }
+
+    /// Shown items, left to right.
+    pub fn shown(&self) -> Vec<Item> {
+        self.order.iter().copied().filter(|i| self.has(*i)).collect()
+    }
+
+    /// Shows or hides an item. Its place in `order` is kept either way.
     pub fn toggle(&mut self, item: Item) {
         if self.has(item) {
             self.items.retain(|i| *i != item);
@@ -536,23 +560,37 @@ impl Config {
         }
     }
 
-    /// Moves the item at `index` within the display order.
-    pub fn move_item(&mut self, index: usize, to: MoveTo) {
-        if index >= self.items.len() {
+    /// Applies a new left-to-right order of the shown items. Hidden items keep their
+    /// slots in `order`, so they come back where they were.
+    pub fn set_shown_order(&mut self, shown: &[Item]) {
+        let slots: Vec<usize> = (0..self.order.len()).filter(|i| self.has(self.order[*i])).collect();
+        if slots.len() != shown.len() {
             return;
         }
-        let item = self.items.remove(index);
-        let target = match to {
-            MoveTo::Left => index.saturating_sub(1),
-            MoveTo::Right => (index + 1).min(self.items.len()),
-            MoveTo::First => 0,
-            MoveTo::Last => self.items.len(),
-        };
-        self.items.insert(target, item);
+        for (slot, item) in slots.into_iter().zip(shown) {
+            self.order[slot] = *item;
+        }
     }
 
-    /// Restores the default left-to-right order of the currently shown items.
+    /// Moves the shown item at `index` (0 = leftmost shown item).
+    pub fn move_item(&mut self, index: usize, to: MoveTo) {
+        let mut shown = self.shown();
+        if index >= shown.len() {
+            return;
+        }
+        let item = shown.remove(index);
+        let target = match to {
+            MoveTo::Left => index.saturating_sub(1),
+            MoveTo::Right => (index + 1).min(shown.len()),
+            MoveTo::First => 0,
+            MoveTo::Last => shown.len(),
+        };
+        shown.insert(target, item);
+        self.set_shown_order(&shown);
+    }
+
+    /// Restores the default order of all items.
     pub fn reset_order(&mut self) {
-        self.items.sort_by_key(|i| Item::ALL.iter().position(|a| a == i).unwrap_or(usize::MAX));
+        self.order = Item::ALL.to_vec();
     }
 }

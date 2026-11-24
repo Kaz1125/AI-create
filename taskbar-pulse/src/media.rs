@@ -5,7 +5,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// While switching tracks, SMTC can briefly report no session or an empty title.
+/// Keep showing the previous track for this long before treating media as gone.
+const GRACE: Duration = Duration::from_secs(6);
 
 use windows::core::GUID;
 use windows::Media::Control::{
@@ -130,8 +134,19 @@ pub fn run(
     };
     let mut last: Option<MediaInfo> = None;
     let mut attempts = 0u32;
+    let mut missing_since: Option<Instant> = None;
+    // Poll faster for a few seconds after a skip so the new track shows up quickly.
+    let mut fast_until: Option<Instant> = None;
     loop {
-        let info = read(&manager, &last, &mut attempts);
+        let mut info = read(&manager, &last, &mut attempts);
+        if info.is_none() && last.is_some() {
+            let since = *missing_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < GRACE {
+                info = last.clone();
+            }
+        } else {
+            missing_since = None;
+        }
         // Thumbnails often arrive a moment after the title: retry soon while missing.
         let retry_art = matches!(&info, Some(i) if i.art.is_none()) && attempts < 4;
         if info != last {
@@ -139,7 +154,8 @@ pub fn run(
             *shared.lock().unwrap() = info;
             changed();
         }
-        let wait = if retry_art { interval_ms.min(1500) } else { interval_ms };
+        let fast = fast_until.map_or(false, |t| Instant::now() < t) || missing_since.is_some();
+        let wait = if fast { interval_ms.min(300) } else if retry_art { interval_ms.min(1500) } else { interval_ms };
         match commands.recv_timeout(Duration::from_millis(wait as u64)) {
             Ok(MediaCommand::Quit) | Err(RecvTimeoutError::Disconnected) => return,
             Ok(MediaCommand::Interval(ms)) => interval_ms = ms,
@@ -155,6 +171,7 @@ pub fn run(
                         let _ = op.join();
                     }
                     std::thread::sleep(Duration::from_millis(150));
+                    fast_until = Some(Instant::now() + Duration::from_secs(3));
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}

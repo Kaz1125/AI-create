@@ -35,6 +35,8 @@ const ICON_PREV: &str = "\u{E892}"; // Segoe MDL2/Fluent "Previous"
 const ICON_NEXT: &str = "\u{E893}"; // "Next"
 const ICON_PLAY: &str = "\u{E768}";
 const ICON_PAUSE: &str = "\u{E769}";
+/// Segoe MDL2 "Audio" (music note), shown grey when nothing is playing.
+const ICON_MUSIC: &str = "\u{E8D6}";
 
 /// One horizontal piece of the overlay.
 pub enum Segment {
@@ -49,6 +51,8 @@ pub enum Segment {
         history: Option<Vec<f32>>,
     },
     Media {
+        /// No media session at all: draw a grey note and grey controls only.
+        idle: bool,
         playing: bool,
         text: String,
         art: Option<Arc<Art>>,
@@ -83,6 +87,10 @@ pub struct Renderer {
     pub media_buttons: Vec<(f32, f32, MediaButton)>,
     /// True when the last frame had a scrolling title (needs animation frames).
     pub marquee_active: bool,
+    /// Horizontal range of each shown item in window pixels (for drag reordering).
+    pub item_ranges: Vec<(f32, f32, Item)>,
+    /// Item being dragged: drawn with a highlight behind it.
+    pub highlight: Option<Item>,
 }
 
 fn color(rgb: u32, a: f32) -> D2D1_COLOR_F {
@@ -158,6 +166,8 @@ impl Renderer {
                 started: Instant::now(),
                 media_buttons: Vec::new(),
                 marquee_active: false,
+                item_ranges: Vec::new(),
+                highlight: None,
             })
         }
     }
@@ -302,10 +312,10 @@ impl Renderer {
     }
 
     /// Width of each segment (including the gap after it), in pixels.
-    fn measure(&self, segs: &[Segment], h: f32, scale: f32, cfg: &Config) -> Result<Vec<f32>> {
+    fn measure(&self, segs: &[(Item, Segment)], h: f32, scale: f32, cfg: &Config) -> Result<Vec<f32>> {
         let gap = 14.0 * scale;
         let mut widths = Vec::with_capacity(segs.len());
-        for s in segs {
+        for (_, s) in segs {
             let w = match s {
                 Segment::Metric { icon, label, value, .. } => {
                     let mut w = 0.0;
@@ -317,7 +327,12 @@ impl Renderer {
                     }
                     w + self.layout(value, self.value_fmt.as_ref().unwrap())?.1
                 }
-                Segment::Media { text, art, .. } => {
+                Segment::Media { idle, text, art, .. } => {
+                    let logo_w = if *idle {
+                        self.layout(ICON_MUSIC, self.icon_fmt.as_ref().unwrap())?.1 + 6.0 * scale
+                    } else {
+                        0.0
+                    };
                     let art_w = if art.is_some() { art_size(h) + 7.0 * scale } else { 0.0 };
                     let f = self.icon_fmt.as_ref().unwrap();
                     let icon_w = self.layout(ICON_PREV, f)?.1
@@ -327,7 +342,11 @@ impl Renderer {
                         + 6.0 * scale;
                     let text_w = self.layout(text, self.label_fmt.as_ref().unwrap())?.1;
                     let max = cfg.media_width * scale;
-                    art_w + icon_w + if cfg.marquee { text_w.min(max) } else { text_w }
+                    if *idle {
+                        logo_w + icon_w - 6.0 * scale
+                    } else {
+                        art_w + icon_w + if cfg.marquee { text_w.min(max) } else { text_w }
+                    }
                 }
                 Segment::Visualizer { bars, .. } => bars.len() as f32 * VIZ_STEP * scale,
                 Segment::Character { .. } => mascot_size(h),
@@ -367,7 +386,7 @@ impl Renderer {
     }
 
     /// Renders the segments. Returns the DIB's DC and size for UpdateLayeredWindow.
-    pub fn draw(&mut self, segs: &[Segment], height: i32, scale: f32, cfg: &Config) -> Result<(HDC, i32, i32)> {
+    pub fn draw(&mut self, segs: &[(Item, Segment)], height: i32, scale: f32, cfg: &Config) -> Result<(HDC, i32, i32)> {
         self.ensure_formats(cfg.font_size * scale)?;
         let h = height as f32;
         let widths = self.measure(segs, h, scale, cfg)?;
@@ -393,8 +412,27 @@ impl Renderer {
                 self.draw_panel(&target, total as f32, h, scale, &pal, cfg.panel_opacity)?;
             }
 
+            // Item ranges (Network has two segments; they are merged into one range).
+            self.item_ranges.clear();
             let mut x = pad;
-            for (seg, w) in segs.iter().zip(&widths) {
+            for ((item, _), w) in segs.iter().zip(&widths) {
+                let end = x + w - 14.0 * scale;
+                match self.item_ranges.last_mut() {
+                    Some(last) if last.2 == *item => last.1 = end,
+                    _ => self.item_ranges.push((x, end, *item)),
+                }
+                x += w;
+            }
+            if let Some(&(a, b, _)) = self.item_ranges.iter().find(|r| Some(r.2) == self.highlight) {
+                let fill = target.CreateSolidColorBrush(&color(pal.gradient[0], 0.28), None)?;
+                let edge = target.CreateSolidColorBrush(&color(pal.gradient[0], 0.9), None)?;
+                let r = rounded(a - 5.0 * scale, 3.0 * scale, b + 5.0 * scale, h - 3.0 * scale, 5.0 * scale);
+                target.FillRoundedRectangle(&r, &fill);
+                target.DrawRoundedRectangle(&r, &edge, 1.0 * scale, None);
+            }
+
+            let mut x = pad;
+            for ((_, seg), w) in segs.iter().zip(&widths) {
                 let seg_w = w - 14.0 * scale;
                 match seg {
                     Segment::Metric { icon, label, value, color: c, history } => {
@@ -419,8 +457,8 @@ impl Renderer {
                         let (lay, _, vh) = self.layout(value, self.value_fmt.as_ref().unwrap())?;
                         target.DrawTextLayout(pt(cx, (h - vh) / 2.0), &lay, &value_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     }
-                    Segment::Media { playing, text: t, art } => {
-                        self.draw_media(&target, x, seg_w, h, scale, cfg, &pal, *playing, t, art.as_deref(), time)?;
+                    Segment::Media { idle, playing, text: t, art } => {
+                        self.draw_media(&target, x, seg_w, h, scale, cfg, &pal, *idle, *playing, t, art.as_deref(), time)?;
                     }
                     Segment::Visualizer { bars, peaks } => {
                         self.draw_visualizer(&target, x, seg_w, h, scale, cfg.visualizer_style, &pal, bars, peaks.as_deref())?;
@@ -676,6 +714,7 @@ impl Renderer {
         scale: f32,
         cfg: &Config,
         pal: &Palette,
+        idle: bool,
         playing: bool,
         text: &str,
         art: Option<&Art>,
@@ -701,8 +740,16 @@ impl Renderer {
 
         // Previous / play-pause / next. Only the marks themselves are clickable
         // (a couple of pixels of slack for easier aim).
-        let icon = target.CreateSolidColorBrush(&color(pal.gradient[0], 1.0), None)?;
-        let side = target.CreateSolidColorBrush(&color(pal.text, 0.8), None)?;
+        if idle {
+            let grey = target.CreateSolidColorBrush(&color(0x9A9A9A, 0.75), None)?;
+            let (lay, iw, ih) = self.layout(ICON_MUSIC, self.icon_fmt.as_ref().unwrap())?;
+            target.DrawTextLayout(pt(cx, (h - ih) / 2.0), &lay, &grey, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            cx += iw + 6.0 * scale;
+        }
+        let (main_rgb, main_a, side_rgb, side_a) =
+            if idle { (0x9A9A9A, 0.75, 0x9A9A9A, 0.55) } else { (pal.gradient[0], 1.0, pal.text, 0.8) };
+        let icon = target.CreateSolidColorBrush(&color(main_rgb, main_a), None)?;
+        let side = target.CreateSolidColorBrush(&color(side_rgb, side_a), None)?;
         let play_glyph = if playing { ICON_PAUSE } else { ICON_PLAY };
         let buttons = [
             (ICON_PREV, MediaButton::Previous, &side),
@@ -714,6 +761,9 @@ impl Renderer {
             target.DrawTextLayout(pt(cx, (h - ih) / 2.0), &lay, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
             self.media_buttons.push((cx - 2.0 * scale, cx + iw + 2.0 * scale, kind));
             cx += iw + if i < 2 { BUTTON_GAP * scale } else { 6.0 * scale };
+        }
+        if idle {
+            return Ok(());
         }
 
 
@@ -900,7 +950,7 @@ pub fn build_segments(
     viz: Option<Vec<f32>>,
     peaks: Option<Vec<f32>>,
     mascot: Option<Segment>,
-) -> Vec<Segment> {
+) -> Vec<(Item, Segment)> {
     let mut mascot = mascot;
     let snap = &visual.shown;
     let mut out = Vec::new();
@@ -931,7 +981,9 @@ pub fn build_segments(
     let temp = |item: Item, label: &str, t: f32, critical: f32| {
         metric(None, label, format!("{:.0}°", t), tint((t - 40.0) / 50.0, t >= critical), spark(item, Some(100.0)))
     };
-    for item in &cfg.items {
+    let mut tagged: Vec<(Item, Segment)> = Vec::new();
+    for item in cfg.shown() {
+        let before = out.len();
         match item {
             Item::Battery => {
                 if let Some(b) = snap.battery {
@@ -1001,14 +1053,17 @@ pub fn build_segments(
                 }
             }
             Item::Media => {
-                if let Some(m) = media {
+                match media {
+                  None => out.push(Segment::Media { idle: true, playing: false, text: String::new(), art: None }),
+                  Some(m) => {
                     let text = if m.artist.is_empty() {
                         m.title.clone()
                     } else {
                         format!("{} - {}", m.title, m.artist)
                     };
                     let art = if cfg.album_art { m.art.clone() } else { None };
-                    out.push(Segment::Media { playing: m.playing, text, art });
+                    out.push(Segment::Media { idle: false, playing: m.playing, text, art });
+                  }
                 }
             }
             Item::Visualizer => {
@@ -1022,8 +1077,9 @@ pub fn build_segments(
                 }
             }
         }
+        tagged.extend(out.drain(before..).map(|s| (item, s)));
     }
-    out
+    tagged
 }
 
 /// Updates an embedded (child) layered window's pixels and size; its position is set

@@ -92,7 +92,7 @@ struct App {
     last_mascot_frame: usize,
     hidden_for_fullscreen: bool,
     /// Drag state: (cursor x at press, offset at press, moved?)
-    drag: Option<(i32, i32, bool)>,
+    drag: Option<Drag>,
     taskbar_created_msg: u32,
 }
 
@@ -447,6 +447,43 @@ unsafe extern "system" fn ctrl_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     }
 }
 
+/// Left-button drag on the strip.
+#[derive(Clone, Copy)]
+enum Drag {
+    /// Ctrl+drag or drag from the empty edge: slide the whole strip along the taskbar.
+    Strip { start_x: i32, start_off: i32, moved: bool },
+    /// Drag on an item: reorder it live among the visible items.
+    Item { item: Item, start_x: i32, moved: bool },
+}
+
+impl App {
+    /// Swaps the dragged item with a neighbour once the cursor passes that neighbour's centre.
+    fn drag_item_to(&mut self, item: Item, x: f32) {
+        let ranges = &self.renderer.item_ranges;
+        let Some(i) = ranges.iter().position(|r| r.2 == item) else { return };
+        let centre = |j: usize| (ranges[j].0 + ranges[j].1) / 2.0;
+        let j = if i > 0 && x < centre(i - 1) {
+            i - 1
+        } else if i + 1 < ranges.len() && x > centre(i + 1) {
+            i + 1
+        } else {
+            return;
+        };
+        let mut visible: Vec<Item> = ranges.iter().map(|r| r.2).collect();
+        visible.swap(i, j);
+        // Items that are on but currently have no data (e.g. no battery) keep their slots.
+        let mut next = visible.into_iter();
+        let shown: Vec<Item> = self
+            .config
+            .shown()
+            .into_iter()
+            .map(|it| if self.renderer.item_ranges.iter().any(|r| r.2 == it) { next.next().unwrap_or(it) } else { it })
+            .collect();
+        self.config.set_shown_order(&shown);
+        self.redraw();
+    }
+}
+
 /// Window procedure of the visible strip: mouse interaction only.
 unsafe extern "system" fn strip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
@@ -457,7 +494,15 @@ unsafe extern "system" fn strip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         WM_LBUTTONDOWN => {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
-            with_app(|app| app.drag = Some((pt.x, app.config.offset_x, false)));
+            let x = lparam_x(lparam) as f32;
+            let ctrl = wparam.0 & 0x0008 != 0; // MK_CONTROL
+            with_app(|app| {
+                let hit = app.renderer.item_ranges.iter().find(|r| x >= r.0 - 7.0 && x <= r.1 + 7.0).map(|r| r.2);
+                app.drag = Some(match hit {
+                    Some(item) if !ctrl => Drag::Item { item, start_x: pt.x, moved: false },
+                    _ => Drag::Strip { start_x: pt.x, start_off: app.config.offset_x, moved: false },
+                });
+            });
             SetCapture(hwnd);
             LRESULT(0)
         }
@@ -466,20 +511,35 @@ unsafe extern "system" fn strip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 // MK_LBUTTON: drag the strip horizontally along the taskbar.
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                with_app(|app| {
-                    if let Some((start_x, start_off, _)) = app.drag {
+                let x = lparam_x(lparam) as f32;
+                with_app(|app| match app.drag {
+                    Some(Drag::Strip { start_x, start_off, moved }) => {
                         let dx = pt.x - start_x;
-                        if dx.abs() > 3 {
+                        if moved || dx.abs() > 3 {
                             let scale = monitor::placement(&app.config).map(|p| p.scale).unwrap_or(1.0);
                             let delta = (dx as f32 / scale) as i32;
                             app.config.offset_x = match app.config.anchor {
                                 Anchor::BesideTray => start_off - delta,
                                 Anchor::Left => start_off + delta,
                             };
-                            app.drag = Some((start_x, start_off, true));
+                            app.drag = Some(Drag::Strip { start_x, start_off, moved: true });
                             app.redraw();
                         }
                     }
+                    Some(Drag::Item { item, start_x, moved }) => {
+                        if moved || (pt.x - start_x).abs() > 4 {
+                            if !moved {
+                                app.drag = Some(Drag::Item { item, start_x, moved: true });
+                                app.renderer.highlight = Some(item);
+                                app.redraw();
+                            }
+                            if let Ok(c) = LoadCursorW(None, IDC_SIZEWE) {
+                                SetCursor(Some(c));
+                            }
+                            app.drag_item_to(item, x);
+                        }
+                    }
+                    None => {}
                 });
             }
             LRESULT(0)
@@ -488,8 +548,11 @@ unsafe extern "system" fn strip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let _ = ReleaseCapture();
             let x = lparam_x(lparam) as f32;
             with_app(|app| {
-                let moved = app.drag.map(|d| d.2).unwrap_or(false);
+                let moved = matches!(app.drag, Some(Drag::Strip { moved: true, .. } | Drag::Item { moved: true, .. }));
                 app.drag = None;
+                if app.renderer.highlight.take().is_some() {
+                    app.redraw();
+                }
                 if moved {
                     app.config.save();
                 } else if let Some((_, _, button)) =
