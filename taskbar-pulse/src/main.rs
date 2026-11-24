@@ -492,10 +492,15 @@ unsafe extern "system" fn strip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 app.drag = None;
                 if moved {
                     app.config.save();
-                } else if let Some((a, b)) = app.renderer.media_hit {
-                    if x >= a && x <= b {
-                        let _ = app.media_tx.send(MediaCommand::TogglePlayPause);
-                    }
+                } else if let Some((_, _, button)) =
+                    app.renderer.media_buttons.iter().find(|(a, b, _)| x >= *a && x <= *b)
+                {
+                    let cmd = match button {
+                        render::MediaButton::Previous => MediaCommand::Previous,
+                        render::MediaButton::PlayPause => MediaCommand::TogglePlayPause,
+                        render::MediaButton::Next => MediaCommand::Next,
+                    };
+                    let _ = app.media_tx.send(cmd);
                 }
             });
             LRESULT(0)

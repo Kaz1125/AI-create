@@ -23,6 +23,19 @@ use crate::config::{Character, Config, Item, Palette, VizStyle};
 use crate::mascot::Animation;
 use crate::media::{Art, MediaInfo};
 
+/// Clickable media controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaButton {
+    Previous,
+    PlayPause,
+    Next,
+}
+
+const ICON_PREV: &str = "\u{E892}"; // Segoe MDL2/Fluent "Previous"
+const ICON_NEXT: &str = "\u{E893}"; // "Next"
+const ICON_PLAY: &str = "\u{E768}";
+const ICON_PAUSE: &str = "\u{E769}";
+
 /// One horizontal piece of the overlay.
 pub enum Segment {
     /// Small label followed by a bold value, e.g. "CPU" "32°".
@@ -67,7 +80,7 @@ pub struct Renderer {
     gif_cache: Option<(u64, Vec<Option<ID2D1Bitmap>>)>,
     started: Instant,
     /// Horizontal range of the play/pause mark in window pixels (for click handling).
-    pub media_hit: Option<(f32, f32)>,
+    pub media_buttons: Vec<(f32, f32, MediaButton)>,
     /// True when the last frame had a scrolling title (needs animation frames).
     pub marquee_active: bool,
 }
@@ -118,6 +131,7 @@ pub fn ramp(t: f32) -> u32 {
     }
 }
 
+const BUTTON_GAP: f32 = 4.0;
 const VIZ_STEP: f32 = 4.5;
 const VIZ_BAR: f32 = 3.0;
 const MARQUEE_SPEED: f32 = 28.0; // DIPs per second
@@ -142,7 +156,7 @@ impl Renderer {
                 art_cache: None,
                 gif_cache: None,
                 started: Instant::now(),
-                media_hit: None,
+                media_buttons: Vec::new(),
                 marquee_active: false,
             })
         }
@@ -305,7 +319,12 @@ impl Renderer {
                 }
                 Segment::Media { text, art, .. } => {
                     let art_w = if art.is_some() { art_size(h) + 7.0 * scale } else { 0.0 };
-                    let icon_w = self.layout("\u{E768}", self.icon_fmt.as_ref().unwrap())?.1 + 5.0 * scale;
+                    let f = self.icon_fmt.as_ref().unwrap();
+                    let icon_w = self.layout(ICON_PREV, f)?.1
+                        + self.layout(ICON_PLAY, f)?.1
+                        + self.layout(ICON_NEXT, f)?.1
+                        + 2.0 * BUTTON_GAP * scale
+                        + 6.0 * scale;
                     let text_w = self.layout(text, self.label_fmt.as_ref().unwrap())?.1;
                     let max = cfg.media_width * scale;
                     art_w + icon_w + if cfg.marquee { text_w.min(max) } else { text_w }
@@ -361,7 +380,7 @@ impl Renderer {
         let target = self.target.clone().unwrap();
         let pal = cfg.palette();
         let time = self.started.elapsed().as_secs_f32();
-        self.media_hit = None;
+        self.media_buttons.clear();
         self.marquee_active = false;
         unsafe {
             target.BindDC(dc, &RECT { left: 0, top: 0, right: total, bottom: height })?;
@@ -680,13 +699,23 @@ impl Renderer {
             cx += size + 7.0 * scale;
         }
 
-        let glyph = if playing { "\u{E769}" } else { "\u{E768}" }; // pause / play
-        let (lay, iw, ih) = self.layout(glyph, self.icon_fmt.as_ref().unwrap())?;
+        // Previous / play-pause / next. Only the marks themselves are clickable
+        // (a couple of pixels of slack for easier aim).
         let icon = target.CreateSolidColorBrush(&color(pal.gradient[0], 1.0), None)?;
-        target.DrawTextLayout(pt(cx, (h - ih) / 2.0), &lay, &icon, D2D1_DRAW_TEXT_OPTIONS_NONE);
-        // Only the play/pause mark is clickable (a couple of pixels of slack for easier aim).
-        self.media_hit = Some((cx - 2.0 * scale, cx + iw + 2.0 * scale));
-        cx += iw + 5.0 * scale;
+        let side = target.CreateSolidColorBrush(&color(pal.text, 0.8), None)?;
+        let play_glyph = if playing { ICON_PAUSE } else { ICON_PLAY };
+        let buttons = [
+            (ICON_PREV, MediaButton::Previous, &side),
+            (play_glyph, MediaButton::PlayPause, &icon),
+            (ICON_NEXT, MediaButton::Next, &side),
+        ];
+        for (i, (glyph, kind, brush)) in buttons.into_iter().enumerate() {
+            let (lay, iw, ih) = self.layout(glyph, self.icon_fmt.as_ref().unwrap())?;
+            target.DrawTextLayout(pt(cx, (h - ih) / 2.0), &lay, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            self.media_buttons.push((cx - 2.0 * scale, cx + iw + 2.0 * scale, kind));
+            cx += iw + if i < 2 { BUTTON_GAP * scale } else { 6.0 * scale };
+        }
+
 
         let (lay, tw, th) = self.layout(text, self.label_fmt.as_ref().unwrap())?;
         let brush = target.CreateSolidColorBrush(&color(pal.text, 1.0), None)?;
