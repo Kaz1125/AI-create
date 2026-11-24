@@ -198,6 +198,21 @@ pub fn decode(id: u16) -> Action {
 }
 
 /// Draws a small three-bar meter icon at runtime (no resource compiler needed).
+/// The app icon (resource 1, embedded by build.rs) at the small-icon size for the
+/// current DPI; falls back to a drawn icon if the resource is missing.
+fn app_icon() -> HICON {
+    unsafe {
+        let module = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok();
+        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        if let Some(m) = module {
+            if let Ok(h) = LoadImageW(Some(m.into()), PCWSTR(1 as _), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR) {
+                return HICON(h.0);
+            }
+        }
+    }
+    make_icon()
+}
+
 fn make_icon() -> HICON {
     const S: i32 = 32;
     let mut pixels = vec![0u32; (S * S) as usize];
@@ -237,7 +252,7 @@ pub fn add(hwnd: HWND) {
     let mut data = icon_data(hwnd);
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = WM_APP_TRAY;
-    data.hIcon = make_icon();
+    data.hIcon = app_icon();
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &data);
     }

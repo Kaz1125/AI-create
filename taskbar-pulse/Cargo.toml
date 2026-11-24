@@ -1,6 +1,6 @@
 [package]
 name = "taskbar-pulse"
-version = "5.2.0"
+version = "5.3.0"
 edition = "2021"
 description = "Windows taskbar overlay that shows hardware usage, now playing media and an audio visualizer"
 license = "MIT"
