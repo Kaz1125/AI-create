@@ -21,6 +21,8 @@ const ID_FULLSCREEN: u16 = 320;
 const ID_AUTOSTART: u16 = 330;
 const ID_OPEN_CONFIG: u16 = 340;
 const ID_EXIT: u16 = 399;
+/// Version shown to the user, e.g. "v5.2". Major = big feature, minor = small fix/feature.
+pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"));
 const ID_THEME: u16 = 400;
 const ID_STYLE: u16 = 420;
 const ID_FLAG: u16 = 440;
@@ -226,7 +228,7 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
         uID: 1,
         ..Default::default()
     };
-    let tip: Vec<u16> = "Taskbar Pulse".encode_utf16().collect();
+    let tip: Vec<u16> = format!("Taskbar Pulse {}", VERSION).encode_utf16().collect();
     data.szTip[..tip.len()].copy_from_slice(&tip);
     data
 }
@@ -483,6 +485,7 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
         append(menu, MF_STRING | check(autostart_enabled()), ID_AUTOSTART as usize, "Windows起動時に開始");
         append(menu, MF_STRING, ID_OPEN_CONFIG as usize, "設定ファイルを開く");
         append(menu, MF_SEPARATOR, 0, "");
+        append(menu, MF_STRING | MF_GRAYED, 0, &format!("Taskbar Pulse {}", VERSION));
         append(menu, MF_STRING, ID_EXIT as usize, "終了");
 
         let mut pt = POINT::default();
