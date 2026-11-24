@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="256" height="256">
+  <!-- Taskbar Pulse logo "G4 dot P": light dot P + green staircase dots (visualizer). No gradients. -->
+  <rect width="160" height="160" rx="36" fill="#1B241D"/>
+  <rect x="38" y="28" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="56" y="28" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="74" y="28" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="38" y="46" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="92" y="46" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="38" y="64" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="92" y="64" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="38" y="82" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="56" y="82" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="74" y="82" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="110" y="82" width="14" height="14" rx="3" fill="#7BD389"/>
+  <rect x="38" y="100" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="92" y="100" width="14" height="14" rx="3" fill="#7BD389"/>
+  <rect x="110" y="100" width="14" height="14" rx="3" fill="#7BD389"/>
+  <rect x="38" y="118" width="14" height="14" rx="3" fill="#E9F5E1"/>
+  <rect x="74" y="118" width="14" height="14" rx="3" fill="#7BD389"/>
+  <rect x="92" y="118" width="14" height="14" rx="3" fill="#7BD389"/>
+  <rect x="110" y="118" width="14" height="14" rx="3" fill="#7BD389"/>
+</svg>
