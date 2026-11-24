@@ -201,6 +201,15 @@ impl Theme {
     }
 }
 
+/// Where to move an item in the display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTo {
+    Left,
+    Right,
+    First,
+    Last,
+}
+
 /// What the mascot slot shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Character {
@@ -517,14 +526,33 @@ impl Config {
         self.items.contains(&item)
     }
 
-    /// Toggle an item while keeping the canonical display order.
+    /// Shows or hides an item. Newly shown items are added at the right end;
+    /// `items` is also the display order (left to right).
     pub fn toggle(&mut self, item: Item) {
         if self.has(item) {
             self.items.retain(|i| *i != item);
         } else {
             self.items.push(item);
-            self.items
-                .sort_by_key(|i| Item::ALL.iter().position(|a| a == i).unwrap_or(usize::MAX));
         }
+    }
+
+    /// Moves the item at `index` within the display order.
+    pub fn move_item(&mut self, index: usize, to: MoveTo) {
+        if index >= self.items.len() {
+            return;
+        }
+        let item = self.items.remove(index);
+        let target = match to {
+            MoveTo::Left => index.saturating_sub(1),
+            MoveTo::Right => (index + 1).min(self.items.len()),
+            MoveTo::First => 0,
+            MoveTo::Last => self.items.len(),
+        };
+        self.items.insert(target, item);
+    }
+
+    /// Restores the default left-to-right order of the currently shown items.
+    pub fn reset_order(&mut self) {
+        self.items.sort_by_key(|i| Item::ALL.iter().position(|a| a == i).unwrap_or(usize::MAX));
     }
 }

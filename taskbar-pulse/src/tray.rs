@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{Anchor, Character, RenderChoice, ColorSlot, Config, Item, Mode, Sensitivity, Theme, VizStyle};
+use crate::config::{Anchor, Character, MoveTo, RenderChoice, ColorSlot, Config, Item, Mode, Sensitivity, Theme, VizStyle};
 use windows::Win32::UI::Controls::Dialogs::*;
 use crate::WM_APP_TRAY;
 
@@ -33,6 +33,10 @@ const ID_MONITOR_PRIMARY: u16 = 520;
 const ID_MONITOR: u16 = 521;
 const ID_EMBED: u16 = 530;
 const ID_SENSOR: u16 = 540;
+const ID_ORDER_RESET: u16 = 599;
+/// 600 + index * 4 + direction (left, right, first, last).
+const ID_ORDER: u16 = 600;
+const MOVES: [MoveTo; 4] = [MoveTo::Left, MoveTo::Right, MoveTo::First, MoveTo::Last];
 const ID_FPS: u16 = 560;
 const ID_RENDER: u16 = 580;
 /// Sensor interval presets in ms (None = follow the mode).
@@ -115,6 +119,8 @@ pub enum Action {
     SetMonitor(Option<String>),
     SetSensorOverride(Option<u32>),
     ToggleEmbed,
+    MoveItem(usize, MoveTo),
+    ResetOrder,
     SetFpsOverride(Option<u32>),
     SetRender(RenderChoice),
     ToggleFullscreenHide,
@@ -171,6 +177,11 @@ pub fn decode(id: u16) -> Action {
         }
         i if (ID_RENDER..ID_RENDER + RENDERS.len() as u16).contains(&i) => Action::SetRender(RENDERS[(i - ID_RENDER) as usize]),
         ID_EMBED => Action::ToggleEmbed,
+        ID_ORDER_RESET => Action::ResetOrder,
+        i if (ID_ORDER..ID_ORDER + 4 * Item::ALL.len() as u16).contains(&i) => {
+            let n = (i - ID_ORDER) as usize;
+            Action::MoveItem(n / 4, MOVES[n % 4])
+        }
         ID_FULLSCREEN => Action::ToggleFullscreenHide,
         ID_AUTOSTART => Action::ToggleAutostart,
         ID_OPEN_CONFIG => Action::OpenConfig,
@@ -267,6 +278,26 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
             append(items, flags, (ID_ITEM + i as u16) as usize, &label);
         }
         append(menu, MF_POPUP, items.0 as usize, "表示項目");
+
+        // Display order: one submenu per shown item, left to right.
+        let order = CreatePopupMenu().unwrap_or_default();
+        let count = cfg.items.len();
+        for (idx, item) in cfg.items.iter().enumerate() {
+            let sub = CreatePopupMenu().unwrap_or_default();
+            let base = ID_ORDER + idx as u16 * 4;
+            let first = idx == 0;
+            let last = idx + 1 == count;
+            let gray = |off: bool| if off { MF_STRING | MF_GRAYED } else { MF_STRING };
+            append(sub, gray(first), (base) as usize, "← 1つ左へ");
+            append(sub, gray(last), (base + 1) as usize, "→ 1つ右へ");
+            append(sub, gray(first), (base + 2) as usize, "⇤ 一番左へ");
+            append(sub, gray(last), (base + 3) as usize, "⇥ 一番右へ");
+            let label = format!("{}. {}", idx + 1, item.label());
+            append(order, MF_POPUP, sub.0 as usize, &label);
+        }
+        append(order, MF_SEPARATOR, 0, "");
+        append(order, MF_STRING, ID_ORDER_RESET as usize, "初期の並び順に戻す");
+        append(menu, MF_POPUP, order.0 as usize, "並び順 (左→右)");
 
         let modes = CreatePopupMenu().unwrap_or_default();
         for (i, mode) in Mode::ALL.iter().enumerate() {

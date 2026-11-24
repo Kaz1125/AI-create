@@ -689,6 +689,18 @@ fn handle_command(hwnd: HWND, id: u16) {
                 ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
             }
         }
+        tray::Action::MoveItem(index, to) => {
+            with_app(|app| {
+                app.config.move_item(index, to);
+                app.apply_config();
+            });
+        }
+        tray::Action::ResetOrder => {
+            with_app(|app| {
+                app.config.reset_order();
+                app.apply_config();
+            });
+        }
         tray::Action::ToggleEmbed => {
             with_app(|app| {
                 app.config.embed = !app.config.embed;
