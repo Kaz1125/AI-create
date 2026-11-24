@@ -19,7 +19,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::anim::Visual;
 use crate::battery_kind_glyph;
-use crate::config::{Character, Config, Item, Palette, VizStyle};
+use crate::config::{Character, Config, Item, Palette, TrackAnim, VizStyle};
 use crate::mascot::Animation;
 use crate::media::{Art, MediaInfo};
 
@@ -82,7 +82,6 @@ pub struct Renderer {
     art_cache: Option<(u64, ID2D1Bitmap)>,
     /// Mascot image frames uploaded to the current render target, keyed by Animation::id.
     gif_cache: Option<(u64, Vec<Option<ID2D1Bitmap>>)>,
-    started: Instant,
     /// Horizontal range of the play/pause mark in window pixels (for click handling).
     pub media_buttons: Vec<(f32, f32, MediaButton)>,
     /// True when the last frame had a scrolling title (needs animation frames).
@@ -91,7 +90,19 @@ pub struct Renderer {
     pub item_ranges: Vec<(f32, f32, Item)>,
     /// Item being dragged: drawn with a highlight behind it.
     pub highlight: Option<Item>,
+    /// Track-change animation state: current title/art, outgoing track and start time.
+    track_key: Option<String>,
+    track_art: Option<Arc<Art>>,
+    track_prev: Option<(String, Option<Arc<Art>>)>,
+    track_start: Option<Instant>,
+    /// When the current title appeared (the marquee starts from the beginning per track).
+    track_since: Instant,
+    /// True while a track-change animation is running (needs animation frames).
+    pub transition_active: bool,
 }
+
+/// Length of the track-change animation.
+const TRACK_ANIM_SECS: f32 = 0.45;
 
 fn color(rgb: u32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
@@ -163,11 +174,16 @@ impl Renderer {
                 dib: None,
                 art_cache: None,
                 gif_cache: None,
-                started: Instant::now(),
                 media_buttons: Vec::new(),
                 marquee_active: false,
                 item_ranges: Vec::new(),
                 highlight: None,
+                track_key: None,
+                track_art: None,
+                track_prev: None,
+                track_start: None,
+                track_since: Instant::now(),
+                transition_active: false,
             })
         }
     }
@@ -398,9 +414,9 @@ impl Renderer {
         }
         let target = self.target.clone().unwrap();
         let pal = cfg.palette();
-        let time = self.started.elapsed().as_secs_f32();
         self.media_buttons.clear();
         self.marquee_active = false;
+        self.transition_active = false;
         unsafe {
             target.BindDC(dc, &RECT { left: 0, top: 0, right: total, bottom: height })?;
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
@@ -458,7 +474,7 @@ impl Renderer {
                         target.DrawTextLayout(pt(cx, (h - vh) / 2.0), &lay, &value_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     }
                     Segment::Media { idle, playing, text: t, art } => {
-                        self.draw_media(&target, x, seg_w, h, scale, cfg, &pal, *idle, *playing, t, art.as_deref(), time)?;
+                        self.draw_media(&target, x, seg_w, h, scale, cfg, &pal, *idle, *playing, t, art.as_ref())?;
                     }
                     Segment::Visualizer { bars, peaks } => {
                         self.draw_visualizer(&target, x, seg_w, h, scale, cfg.visualizer_style, &pal, bars, peaks.as_deref())?;
@@ -704,6 +720,108 @@ impl Renderer {
         Ok(())
     }
 
+    /// Tracks title changes and returns the outgoing track plus eased progress (0..1)
+    /// while a track-change animation is running.
+    fn track_transition(&mut self, cfg: &Config, text: &str, art: Option<&Arc<Art>>) -> Option<(f32, String, Option<Arc<Art>>)> {
+        let enabled = cfg.track_anim != TrackAnim::None && cfg.animated();
+        if self.track_key.as_deref() != Some(text) {
+            match self.track_key.take() {
+                Some(old) if enabled => {
+                    self.track_prev = Some((old, self.track_art.take()));
+                    self.track_start = Some(Instant::now());
+                }
+                _ => {
+                    self.track_prev = None;
+                    self.track_start = None;
+                }
+            }
+            self.track_key = Some(text.to_string());
+            self.track_since = Instant::now();
+        }
+        self.track_art = art.cloned();
+        let start = self.track_start?;
+        let p = start.elapsed().as_secs_f32() / TRACK_ANIM_SECS;
+        if p >= 1.0 || !enabled {
+            self.track_prev = None;
+            self.track_start = None;
+            return None;
+        }
+        self.transition_active = true;
+        let e = 1.0 - (1.0 - p).powi(3); // ease-out cubic
+        let (t, a) = self.track_prev.clone()?;
+        Some((e, t, a))
+    }
+
+    /// Opacity and transform for incoming (`incoming = true`) or outgoing content at eased
+    /// progress `e`, scaling around (`ox`, `oy`).
+    fn track_effect(kind: TrackAnim, e: f32, incoming: bool, h: f32, scale: f32, ox: f32, oy: f32) -> (f32, Matrix3x2) {
+        let k = if incoming { 1.0 - e } else { e }; // 0 = at rest, 1 = fully away
+        let alpha = 1.0 - k;
+        let dir = if incoming { 1.0 } else { -1.0 };
+        let (dx, dy, z) = match kind {
+            TrackAnim::None | TrackAnim::Fade => (0.0, 0.0, 1.0),
+            TrackAnim::SlideUp => (0.0, dir * k * h, 1.0),
+            TrackAnim::SlideDown => (0.0, -dir * k * h, 1.0),
+            TrackAnim::SlideLeft => (dir * k * 36.0 * scale, 0.0, 1.0),
+            TrackAnim::Zoom => (0.0, 0.0, if incoming { 1.0 - 0.4 * k } else { 1.0 + 0.3 * k }),
+        };
+        let m = Matrix3x2 { M11: z, M12: 0.0, M21: 0.0, M22: z, M31: ox * (1.0 - z) + dx, M32: oy * (1.0 - z) + dy };
+        (alpha, m)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_art(&mut self, target: &ID2D1DCRenderTarget, art: &Art, cx: f32, h: f32, scale: f32, alpha: f32) -> Result<()> {
+        let size = art_size(h);
+        let top = (h - size) / 2.0;
+        if let Some(bmp) = self.art_bitmap(target, art) {
+            let brush = target.CreateBitmapBrush(&bmp, None, None)?;
+            // Centre-crop: scale so the short side fills `size`.
+            let s = size / art.width.min(art.height) as f32;
+            let ox = cx - (art.width as f32 * s - size) / 2.0;
+            let oy = top - (art.height as f32 * s - size) / 2.0;
+            brush.SetTransform(&Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: ox, M32: oy });
+            brush.SetOpacity(alpha);
+            target.FillRoundedRectangle(&rounded(cx, top, cx + size, top + size, 4.0 * scale), &brush);
+            let edge = target.CreateSolidColorBrush(&color(0xFFFFFF, 0.18 * alpha), None)?;
+            target.DrawRoundedRectangle(&rounded(cx, top, cx + size, top + size, 4.0 * scale), &edge, 1.0, None);
+        }
+        Ok(())
+    }
+
+    /// Draws the title in [cx, cx + avail] (already clipped by the caller).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_title(
+        &mut self,
+        target: &ID2D1DCRenderTarget,
+        text: &str,
+        cx: f32,
+        avail: f32,
+        h: f32,
+        scale: f32,
+        cfg: &Config,
+        pal: &Palette,
+        time: f32,
+        alpha: f32,
+    ) -> Result<()> {
+        let (lay, tw, th) = self.layout(text, self.label_fmt.as_ref().unwrap())?;
+        let brush = target.CreateSolidColorBrush(&color(pal.text, alpha), None)?;
+        let y = (h - th) / 2.0;
+        if cfg.marquee && tw > avail + 0.5 {
+            // Seamless loop: draw the title twice with a gap.
+            self.marquee_active = true;
+            let cycle = tw + MARQUEE_GAP * scale;
+            // Pause 1.5 s at the start of each loop so the beginning is readable.
+            let period = cycle / (MARQUEE_SPEED * scale) + 1.5;
+            let t = (time % period - 1.5).max(0.0);
+            let offset = t * MARQUEE_SPEED * scale;
+            target.DrawTextLayout(pt(cx - offset, y), &lay, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            target.DrawTextLayout(pt(cx - offset + cycle, y), &lay, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        } else {
+            target.DrawTextLayout(pt(cx, y), &lay, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn draw_media(
         &mut self,
@@ -717,35 +835,42 @@ impl Renderer {
         idle: bool,
         playing: bool,
         text: &str,
-        art: Option<&Art>,
-        time: f32,
+        art: Option<&Arc<Art>>,
     ) -> Result<()> {
+        // Idle counts as an empty title, so idle -> playing animates the new track in.
+        let transition = self.track_transition(cfg, if idle { "" } else { text }, art);
+        let identity = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
+        let kind = cfg.track_anim;
         let mut cx = x;
-        if let Some(art) = art {
-            let size = art_size(h);
-            let top = (h - size) / 2.0;
-            if let Some(bmp) = self.art_bitmap(target, art) {
-                let brush = target.CreateBitmapBrush(&bmp, None, None)?;
-                // Centre-crop: scale so the short side fills `size`.
-                let s = size / art.width.min(art.height) as f32;
-                let ox = cx - (art.width as f32 * s - size) / 2.0;
-                let oy = top - (art.height as f32 * s - size) / 2.0;
-                brush.SetTransform(&Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: ox, M32: oy });
-                target.FillRoundedRectangle(&rounded(cx, top, cx + size, top + size, 4.0 * scale), &brush);
-                let edge = target.CreateSolidColorBrush(&color(0xFFFFFF, 0.18), None)?;
-                target.DrawRoundedRectangle(&rounded(cx, top, cx + size, top + size, 4.0 * scale), &edge, 1.0, None);
-            }
-            cx += size + 7.0 * scale;
-        }
 
-        // Previous / play-pause / next. Only the marks themselves are clickable
-        // (a couple of pixels of slack for easier aim).
         if idle {
             let grey = target.CreateSolidColorBrush(&color(0x9A9A9A, 0.75), None)?;
             let (lay, iw, ih) = self.layout(ICON_MUSIC, self.icon_fmt.as_ref().unwrap())?;
             target.DrawTextLayout(pt(cx, (h - ih) / 2.0), &lay, &grey, D2D1_DRAW_TEXT_OPTIONS_NONE);
             cx += iw + 6.0 * scale;
+        } else if art.is_some() {
+            let size = art_size(h);
+            let (ox, oy) = (cx + size / 2.0, h / 2.0);
+            target.PushAxisAlignedClip(&rect(cx - 1.0, 0.0, cx + size + 1.0, h), D2D1_ANTIALIAS_MODE_ALIASED);
+            if let Some((e, _, old_art)) = &transition {
+                if let Some(old) = old_art {
+                    let (a, m) = Self::track_effect(kind, *e, false, h, scale, ox, oy);
+                    target.SetTransform(&m);
+                    self.draw_art(target, old, cx, h, scale, a)?;
+                }
+                let (a, m) = Self::track_effect(kind, *e, true, h, scale, ox, oy);
+                target.SetTransform(&m);
+                self.draw_art(target, art.unwrap(), cx, h, scale, a)?;
+                target.SetTransform(&identity);
+            } else {
+                self.draw_art(target, art.unwrap(), cx, h, scale, 1.0)?;
+            }
+            target.PopAxisAlignedClip();
+            cx += size + 7.0 * scale;
         }
+
+        // Previous / play-pause / next. Only the marks themselves are clickable
+        // (a couple of pixels of slack for easier aim).
         let (main_rgb, main_a, side_rgb, side_a) =
             if idle { (0x9A9A9A, 0.75, 0x9A9A9A, 0.55) } else { (pal.gradient[0], 1.0, pal.text, 0.8) };
         let icon = target.CreateSolidColorBrush(&color(main_rgb, main_a), None)?;
@@ -766,28 +891,25 @@ impl Renderer {
             return Ok(());
         }
 
-
-        let (lay, tw, th) = self.layout(text, self.label_fmt.as_ref().unwrap())?;
-        let brush = target.CreateSolidColorBrush(&color(pal.text, 1.0), None)?;
-        let avail = (x + w) - cx;
-        let y = (h - th) / 2.0;
-        if cfg.marquee && tw > avail + 0.5 {
-            // Seamless loop: draw the title twice with a gap, clipped to the title area.
-            self.marquee_active = true;
-            let cycle = tw + MARQUEE_GAP * scale;
-            // Pause 1.5 s at the start of each loop so the beginning is readable.
-            let period = cycle / (MARQUEE_SPEED * scale) + 1.5;
-            let t = (time % period - 1.5).max(0.0);
-            let offset = t * MARQUEE_SPEED * scale;
-            target.PushAxisAlignedClip(&rect(cx, 0.0, cx + avail, h), D2D1_ANTIALIAS_MODE_ALIASED);
-            target.DrawTextLayout(pt(cx - offset, y), &lay, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
-            target.DrawTextLayout(pt(cx - offset + cycle, y), &lay, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
-            target.PopAxisAlignedClip();
+        let avail = ((x + w) - cx).max(0.0);
+        let (_, tw, _) = self.layout(text, self.label_fmt.as_ref().unwrap())?;
+        let clip_w = if cfg.marquee { avail } else { avail.max(tw) };
+        target.PushAxisAlignedClip(&rect(cx, 0.0, cx + clip_w, h), D2D1_ANTIALIAS_MODE_ALIASED);
+        let (ox, oy) = (cx + clip_w.min(tw) / 2.0, h / 2.0);
+        if let Some((e, old_text, _)) = &transition {
+            if !old_text.is_empty() {
+                let (a, m) = Self::track_effect(kind, *e, false, h, scale, ox, oy);
+                target.SetTransform(&m);
+                self.draw_title(target, old_text, cx, avail, h, scale, cfg, pal, 0.0, a)?;
+            }
+            let (a, m) = Self::track_effect(kind, *e, true, h, scale, ox, oy);
+            target.SetTransform(&m);
+            self.draw_title(target, text, cx, avail, h, scale, cfg, pal, 0.0, a)?;
+            target.SetTransform(&identity);
         } else {
-            target.PushAxisAlignedClip(&rect(cx, 0.0, cx + avail.max(tw), h), D2D1_ANTIALIAS_MODE_ALIASED);
-            target.DrawTextLayout(pt(cx, y), &lay, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
-            target.PopAxisAlignedClip();
+            self.draw_title(target, text, cx, avail, h, scale, cfg, pal, self.track_since.elapsed().as_secs_f32(), 1.0)?;
         }
+        target.PopAxisAlignedClip();
         Ok(())
     }
 

@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{Anchor, Character, MoveTo, RenderChoice, ColorSlot, Config, Item, Mode, Sensitivity, Theme, VizStyle};
+use crate::config::{Anchor, Character, MoveTo, RenderChoice, ColorSlot, Config, Item, Mode, Sensitivity, Theme, TrackAnim, VizStyle};
 use windows::Win32::UI::Controls::Dialogs::*;
 use crate::WM_APP_TRAY;
 
@@ -39,6 +39,7 @@ const ID_ORDER: u16 = 600;
 const MOVES: [MoveTo; 4] = [MoveTo::Left, MoveTo::Right, MoveTo::First, MoveTo::Last];
 const ID_FPS: u16 = 560;
 const ID_RENDER: u16 = 580;
+const ID_TRACK_ANIM: u16 = 700;
 /// Sensor interval presets in ms (None = follow the mode).
 const SENSOR_PRESETS: [Option<u32>; 10] =
     [None, Some(250), Some(500), Some(1000), Some(1500), Some(2000), Some(3000), Some(5000), Some(10_000), Some(30_000)];
@@ -109,6 +110,7 @@ pub enum Action {
     SetSensitivity(Sensitivity),
     SetTheme(Theme),
     SetVizStyle(VizStyle),
+    SetTrackAnim(TrackAnim),
     Toggle(Flag),
     PanelOpacity(f32),
     PickColor(ColorSlot),
@@ -151,6 +153,9 @@ pub fn decode(id: u16) -> Action {
         }
         i if (ID_STYLE..ID_STYLE + VizStyle::ALL.len() as u16).contains(&i) => {
             Action::SetVizStyle(VizStyle::ALL[(i - ID_STYLE) as usize])
+        }
+        i if (ID_TRACK_ANIM..ID_TRACK_ANIM + TrackAnim::ALL.len() as u16).contains(&i) => {
+            Action::SetTrackAnim(TrackAnim::ALL[(i - ID_TRACK_ANIM) as usize])
         }
         i if (ID_FLAG..ID_FLAG + FLAGS.len() as u16).contains(&i) => Action::Toggle(FLAGS[(i - ID_FLAG) as usize]),
         i if (ID_OPACITY..ID_OPACITY + OPACITIES.len() as u16).contains(&i) => {
@@ -395,6 +400,12 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
         }
         append(look, MF_POPUP, styles.0 as usize, "ビジュアライザーの形");
         let animated = cfg.animated();
+        let track = CreatePopupMenu().unwrap_or_default();
+        for (i, a) in TrackAnim::ALL.iter().enumerate() {
+            append(track, MF_STRING | check(cfg.track_anim == *a), (ID_TRACK_ANIM + i as u16) as usize, a.label());
+        }
+        let track_label = if animated { "曲切り替えアニメーション" } else { "曲切り替えアニメーション (標準/高負荷モードで有効)" };
+        append(look, MF_POPUP, track.0 as usize, track_label);
         for f in FLAGS {
             if f == Flag::ColorByValue {
                 continue;

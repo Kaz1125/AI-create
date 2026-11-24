@@ -258,6 +258,33 @@ impl VizStyle {
     }
 }
 
+/// Animation played when the now-playing track changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackAnim {
+    None,
+    Fade,
+    SlideUp,
+    SlideDown,
+    SlideLeft,
+    Zoom,
+}
+
+impl TrackAnim {
+    pub const ALL: [TrackAnim; 6] =
+        [TrackAnim::None, TrackAnim::Fade, TrackAnim::SlideUp, TrackAnim::SlideDown, TrackAnim::SlideLeft, TrackAnim::Zoom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TrackAnim::None => "なし",
+            TrackAnim::Fade => "フェード",
+            TrackAnim::SlideUp => "スライドイン (下から)",
+            TrackAnim::SlideDown => "スライドイン (上から)",
+            TrackAnim::SlideLeft => "スライドイン (右から)",
+            TrackAnim::Zoom => "ズーム",
+        }
+    }
+}
+
 /// Which colour the user is editing from the colour picker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorSlot {
@@ -344,6 +371,8 @@ pub struct Config {
     /// Visualizer sensitivity.
     pub visualizer_sensitivity: Sensitivity,
     pub visualizer_style: VizStyle,
+    /// Animation when the track changes (Standard / Performance modes only).
+    pub track_anim: TrackAnim,
     /// Small markers that hold each bar's recent peak and fall slowly.
     pub peak_hold: bool,
     /// Thin 60-second history graph behind each value.
@@ -408,6 +437,7 @@ impl Default for Config {
             visualizer_bars: 16,
             visualizer_sensitivity: Sensitivity::Auto,
             visualizer_style: VizStyle::Bars,
+            track_anim: TrackAnim::SlideUp,
             peak_hold: true,
             sparklines: true,
             color_by_value: true,

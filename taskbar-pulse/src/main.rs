@@ -244,7 +244,7 @@ impl App {
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         let moving = self.smoothing() && self.visual.tick(dt);
-        let mut busy = moving || self.renderer.marquee_active;
+        let mut busy = moving || self.renderer.marquee_active || self.renderer.transition_active;
         if self.config.has(Item::Mascot) {
             // Faster when the CPU is busy: 0.6x at idle up to 3x at 100 %.
             let cpu = self.visual.shown.cpu.unwrap_or(0.0);
@@ -652,6 +652,12 @@ fn handle_command(hwnd: HWND, id: u16) {
         tray::Action::SetTheme(theme) => {
             with_app(|app| {
                 app.config.theme = theme;
+                app.apply_config();
+            });
+        }
+        tray::Action::SetTrackAnim(a) => {
+            with_app(|app| {
+                app.config.track_anim = a;
                 app.apply_config();
             });
         }
