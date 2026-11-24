@@ -20,10 +20,11 @@ pub enum Item {
     Network,
     Media,
     Visualizer,
+    Mascot,
 }
 
 impl Item {
-    pub const ALL: [Item; 14] = [
+    pub const ALL: [Item; 15] = [
         Item::Battery,
         Item::Devices,
         Item::CpuTemp,
@@ -38,6 +39,7 @@ impl Item {
         Item::Network,
         Item::Media,
         Item::Visualizer,
+        Item::Mascot,
     ];
 
     pub fn label(self) -> &'static str {
@@ -56,6 +58,7 @@ impl Item {
             Item::Network => "ネットワーク速度",
             Item::Media => "再生中のメディア",
             Item::Visualizer => "オーディオビジュアライザー",
+            Item::Mascot => "ミニキャラ / GIF",
         }
     }
 }
@@ -198,6 +201,32 @@ impl Theme {
     }
 }
 
+/// What the mascot slot shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Character {
+    /// Squishy bouncing blob.
+    Slime,
+    /// Cat face that bobs, blinks and twitches its ears.
+    Cat,
+    /// Floating ghost with a wavy hem.
+    Ghost,
+    /// The image file in `mascot_image`.
+    Image,
+}
+
+impl Character {
+    pub const BUILT_IN: [Character; 3] = [Character::Slime, Character::Cat, Character::Ghost];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Character::Slime => "ぷにスライム",
+            Character::Cat => "ネコ",
+            Character::Ghost => "おばけ",
+            Character::Image => "画像 / GIF",
+        }
+    }
+}
+
 /// Shape of the audio visualizer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VizStyle {
@@ -297,6 +326,13 @@ pub struct Config {
     /// Panel opacity 0..1.
     pub panel_opacity: f32,
     pub theme: Theme,
+    pub mascot: Character,
+    /// Image shown when `mascot` is Image (GIF, PNG, JPEG, WebP...).
+    pub mascot_image: Option<String>,
+    /// Mascot moves faster as CPU usage rises.
+    pub mascot_cpu_speed: bool,
+    /// Monitor to show on, by device name (e.g. \\.\DISPLAY2). None = primary.
+    pub monitor: Option<String>,
     /// Text colour as 0xRRGGBB.
     pub text_color: u32,
     /// Label colour as 0xRRGGBB.
@@ -343,6 +379,10 @@ impl Default for Config {
             panel: true,
             panel_opacity: 0.55,
             theme: Theme::Aurora,
+            mascot: Character::Slime,
+            mascot_image: None,
+            mascot_cpu_speed: true,
+            monitor: None,
             text_color: 0xFFFFFF,
             label_color: 0xC8C8C8,
             accent_color: 0x3DDCFF,

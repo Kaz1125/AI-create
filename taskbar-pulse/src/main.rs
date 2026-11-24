@@ -5,7 +5,9 @@
 mod anim;
 mod audio;
 mod config;
+mod mascot;
 mod media;
+mod monitor;
 mod render;
 mod sensors;
 mod tray;
@@ -62,6 +64,11 @@ struct App {
     last_frame: Instant,
     /// The previous animation frame changed nothing on screen.
     anim_idle: bool,
+    /// Loaded mascot image and the path it came from.
+    mascot_image: Option<(String, Arc<mascot::Animation>)>,
+    /// Seconds of mascot motion (advances faster under CPU load when enabled).
+    mascot_phase: f32,
+    last_mascot_frame: usize,
     hidden_for_fullscreen: bool,
     /// Drag state: (cursor x at press, offset at press, moved?)
     drag: Option<(i32, i32, bool)>,
@@ -74,34 +81,6 @@ thread_local! {
 
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|a| a.try_borrow_mut().ok().and_then(|mut a| a.as_mut().map(f)))
-}
-
-/// Where the taskbar is and where our strip should go.
-struct Placement {
-    taskbar: RECT,
-    tray_left: i32,
-    scale: f32,
-}
-
-fn placement() -> Option<Placement> {
-    unsafe {
-        let taskbar = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
-        let mut rect = RECT::default();
-        GetWindowRect(taskbar, &mut rect).ok()?;
-        let dpi = GetDpiForWindow(taskbar);
-        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-        // Notification area. Present on Windows 10 and 11 (the 11 taskbar still keeps this
-        // window for compatibility); fall back to a fixed margin if it is missing.
-        let tray_left = FindWindowExW(Some(taskbar), None, w!("TrayNotifyWnd"), PCWSTR::null())
-            .ok()
-            .and_then(|tray| {
-                let mut r = RECT::default();
-                GetWindowRect(tray, &mut r).ok().map(|_| r.left)
-            })
-            .filter(|l| *l > rect.left && *l < rect.right)
-            .unwrap_or(rect.right - (320.0 * scale) as i32);
-        Some(Placement { taskbar: rect, tray_left, scale })
-    }
 }
 
 fn fullscreen_app_active() -> bool {
@@ -132,11 +111,12 @@ impl App {
             }
         }
 
-        let Some(p) = placement() else { return };
+        let Some(p) = monitor::placement(&self.config) else { return };
         let media = self.media.lock().unwrap().clone();
         let viz = self.visualizer_active().then(|| self.visualizer.snapshot());
         let peaks = (self.config.peak_hold && viz.is_some()).then(|| self.visual.peaks.clone());
-        let segs = render::build_segments(&self.config, &self.visual, media.as_ref(), viz, peaks);
+        let mascot = self.mascot_segment();
+        let segs = render::build_segments(&self.config, &self.visual, media.as_ref(), viz, peaks, mascot);
         let height = p.taskbar.bottom - p.taskbar.top;
         if height <= 0 {
             return;
@@ -151,6 +131,47 @@ impl App {
                 render::present(self.hwnd, dc, x, p.taskbar.top, w, h);
             }
             Err(_) => {}
+        }
+    }
+
+    fn mascot_segment(&self) -> Option<render::Segment> {
+        if !self.config.has(Item::Mascot) {
+            return None;
+        }
+        match (self.config.mascot, &self.mascot_image) {
+            (config::Character::Image, Some((_, anim))) => Some(render::Segment::Image {
+                anim: anim.clone(),
+                frame: anim.frame_at((self.mascot_phase as f64 * 1000.0) as u64),
+            }),
+            // No image chosen yet (or it failed to load): fall back to the slime.
+            (config::Character::Image, None) => {
+                Some(render::Segment::Character { kind: config::Character::Slime, phase: self.mascot_phase })
+            }
+            (kind, _) => Some(render::Segment::Character { kind, phase: self.mascot_phase }),
+        }
+    }
+
+    /// Loads the chosen image when the path changed. Returns false if it could not be read.
+    fn load_mascot_image(&mut self) -> bool {
+        let wanted = match (&self.config.mascot, &self.config.mascot_image) {
+            (config::Character::Image, Some(p)) => p.clone(),
+            _ => {
+                self.mascot_image = None;
+                return true;
+            }
+        };
+        if self.mascot_image.as_ref().map(|(p, _)| p == &wanted).unwrap_or(false) {
+            return true;
+        }
+        match mascot::load(std::path::Path::new(&wanted)) {
+            Some(anim) => {
+                self.mascot_image = Some((wanted, Arc::new(anim)));
+                true
+            }
+            None => {
+                self.mascot_image = None;
+                false
+            }
         }
     }
 
@@ -172,6 +193,21 @@ impl App {
         self.last_frame = now;
         let moving = self.smoothing() && self.visual.tick(dt);
         let mut busy = moving || self.renderer.marquee_active;
+        if self.config.has(Item::Mascot) {
+            // Faster when the CPU is busy: 0.6x at idle up to 3x at 100 %.
+            let cpu = self.visual.shown.cpu.unwrap_or(0.0);
+            let speed = if self.config.mascot_cpu_speed { 0.6 + cpu / 100.0 * 2.4 } else { 1.0 };
+            self.mascot_phase += dt * speed;
+            match (&self.config.mascot, &self.mascot_image) {
+                (config::Character::Image, Some((_, anim))) => {
+                    // Redraw a GIF only when its frame changes.
+                    let f = anim.frame_at((self.mascot_phase as f64 * 1000.0) as u64);
+                    busy |= f != self.last_mascot_frame;
+                    self.last_mascot_frame = f;
+                }
+                _ => busy = true,
+            }
+        }
         if self.visualizer_active() {
             let bars = self.visualizer.snapshot();
             busy |= bars.iter().any(|v| *v > 0.005);
@@ -206,6 +242,7 @@ impl App {
         // number easing. Low-load modes have no animation at all.
         let wants_anim = viz
             || self.config.has(Item::Media)
+            || self.config.has(Item::Mascot)
             || self.config.smooth_numbers;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
@@ -282,7 +319,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some((start_x, start_off, _)) = app.drag {
                         let dx = pt.x - start_x;
                         if dx.abs() > 3 {
-                            let scale = placement().map(|p| p.scale).unwrap_or(1.0);
+                            let scale = monitor::placement(&app.config).map(|p| p.scale).unwrap_or(1.0);
                             let delta = (dx as f32 / scale) as i32;
                             app.config.offset_x = match app.config.anchor {
                                 Anchor::BesideTray => start_off - delta,
@@ -431,6 +468,58 @@ fn handle_command(hwnd: HWND, id: u16) {
                 });
             }
         }
+        tray::Action::SetCharacter(kind) => {
+            with_app(|app| {
+                app.config.mascot = kind;
+                if !app.config.has(Item::Mascot) {
+                    app.config.toggle(Item::Mascot);
+                }
+                app.apply_config();
+            });
+        }
+        tray::Action::PickImage => {
+            if let Some(path) = tray::pick_image(hwnd) {
+                let ok = with_app(|app| {
+                    let previous = (app.config.mascot, app.config.mascot_image.clone());
+                    app.config.mascot = config::Character::Image;
+                    app.config.mascot_image = Some(path.clone());
+                    if !app.config.has(Item::Mascot) {
+                        app.config.toggle(Item::Mascot);
+                    }
+                    let ok = app.load_mascot_image();
+                    if !ok {
+                        (app.config.mascot, app.config.mascot_image) = previous;
+                        app.load_mascot_image();
+                    }
+                    app.apply_config();
+                    ok
+                })
+                .unwrap_or(false);
+                if !ok {
+                    unsafe {
+                        MessageBoxW(
+                            Some(hwnd),
+                            w!("画像を読み込めませんでした。GIF / PNG / JPEG / WebP などの画像ファイルを選んでください。"),
+                            w!("Taskbar Pulse"),
+                            MB_OK | MB_ICONWARNING,
+                        );
+                    }
+                }
+            }
+        }
+        tray::Action::ToggleMascotSpeed => {
+            with_app(|app| {
+                app.config.mascot_cpu_speed = !app.config.mascot_cpu_speed;
+                app.apply_config();
+            });
+        }
+        tray::Action::SetMonitor(name) => {
+            with_app(|app| {
+                app.config.monitor = name;
+                app.config.offset_x = Config::default().offset_x;
+                app.apply_config();
+            });
+        }
         tray::Action::ToggleFullscreenHide => {
             with_app(|app| {
                 app.config.hide_in_fullscreen = !app.config.hide_in_fullscreen;
@@ -564,12 +653,18 @@ fn main() -> windows::core::Result<()> {
             visual: anim::Visual::new(),
             last_frame: Instant::now(),
             anim_idle: false,
+            mascot_image: None,
+            mascot_phase: 0.0,
+            last_mascot_frame: usize::MAX,
             hidden_for_fullscreen: false,
             drag: None,
             taskbar_created_msg: RegisterWindowMessageW(w!("TaskbarCreated")),
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
-        with_app(|app| app.apply_config());
+        with_app(|app| {
+            app.load_mascot_image();
+            app.apply_config();
+        });
 
         tray::add(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);

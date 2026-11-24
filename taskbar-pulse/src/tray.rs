@@ -7,7 +7,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{Anchor, ColorSlot, Config, Item, Mode, Sensitivity, Theme, VizStyle};
+use crate::config::{Anchor, Character, ColorSlot, Config, Item, Mode, Sensitivity, Theme, VizStyle};
 use windows::Win32::UI::Controls::Dialogs::*;
 use crate::WM_APP_TRAY;
 
@@ -26,6 +26,11 @@ const ID_STYLE: u16 = 420;
 const ID_FLAG: u16 = 440;
 const ID_OPACITY: u16 = 460;
 const ID_COLOR: u16 = 480;
+const ID_CHAR: u16 = 500;
+const ID_PICK_IMAGE: u16 = 510;
+const ID_MASCOT_SPEED: u16 = 511;
+const ID_MONITOR_PRIMARY: u16 = 520;
+const ID_MONITOR: u16 = 521;
 const OPACITIES: [(f32, &str); 3] = [(0.35, "薄い"), (0.55, "普通"), (0.8, "濃い")];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +97,11 @@ pub enum Action {
     Toggle(Flag),
     PanelOpacity(f32),
     PickColor(ColorSlot),
+    SetCharacter(Character),
+    PickImage,
+    ToggleMascotSpeed,
+    /// None = primary monitor.
+    SetMonitor(Option<String>),
     ToggleFullscreenHide,
     ToggleAutostart,
     OpenConfig,
@@ -128,6 +138,16 @@ pub fn decode(id: u16) -> Action {
         i if (ID_COLOR..ID_COLOR + ColorSlot::ALL.len() as u16).contains(&i) => {
             Action::PickColor(ColorSlot::ALL[(i - ID_COLOR) as usize])
         }
+        i if (ID_CHAR..ID_CHAR + Character::BUILT_IN.len() as u16).contains(&i) => {
+            Action::SetCharacter(Character::BUILT_IN[(i - ID_CHAR) as usize])
+        }
+        ID_PICK_IMAGE => Action::PickImage,
+        ID_MASCOT_SPEED => Action::ToggleMascotSpeed,
+        ID_MONITOR_PRIMARY => Action::SetMonitor(None),
+        i if (ID_MONITOR..ID_MONITOR + 16).contains(&i) => match crate::monitor::list().get((i - ID_MONITOR) as usize) {
+            Some(m) => Action::SetMonitor(Some(m.name.clone())),
+            None => Action::None,
+        },
         ID_FULLSCREEN => Action::ToggleFullscreenHide,
         ID_AUTOSTART => Action::ToggleAutostart,
         ID_OPEN_CONFIG => Action::OpenConfig,
@@ -279,6 +299,39 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
         append(look, MF_POPUP, opacity.0 as usize, "背景パネルの濃さ");
         append(menu, MF_POPUP, look.0 as usize, "見た目・エフェクト");
 
+        // Mascot
+        let mascot = CreatePopupMenu().unwrap_or_default();
+        let shown = cfg.has(Item::Mascot);
+        for (i, c) in Character::BUILT_IN.iter().enumerate() {
+            append(mascot, MF_STRING | check(shown && cfg.mascot == *c), (ID_CHAR + i as u16) as usize, c.label());
+        }
+        let image_label = match (&cfg.mascot_image, cfg.mascot == Character::Image) {
+            (Some(p), _) => {
+                let name = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                format!("画像 / GIF を選ぶ… (現在: {name})")
+            }
+            _ => "画像 / GIF を選ぶ…".to_string(),
+        };
+        append(mascot, MF_STRING | check(shown && cfg.mascot == Character::Image), ID_PICK_IMAGE as usize, &image_label);
+        append(mascot, MF_SEPARATOR, 0, "");
+        append(mascot, MF_STRING | check(cfg.mascot_cpu_speed), ID_MASCOT_SPEED as usize, "CPU負荷で動きが速くなる");
+        if cfg.mode.visualizer_interval_ms().is_none() {
+            append(mascot, MF_STRING | MF_GRAYED, 0, "※ 低負荷モードでは止まった表示になります");
+        }
+        append(menu, MF_POPUP, mascot.0 as usize, "ミニキャラ / GIF");
+
+        // Monitor
+        let mons = CreatePopupMenu().unwrap_or_default();
+        append(mons, MF_STRING | check(cfg.monitor.is_none()), ID_MONITOR_PRIMARY as usize, "メインモニター (自動)");
+        for (i, m) in crate::monitor::list().iter().enumerate().take(16) {
+            let w = m.rect.right - m.rect.left;
+            let h = m.rect.bottom - m.rect.top;
+            let short = m.name.trim_start_matches("\\\\.\\");
+            let label = format!("{}: {}  {}×{}{}", i + 1, short, w, h, if m.primary { " (メイン)" } else { "" });
+            append(mons, MF_STRING | check(cfg.monitor.as_deref() == Some(m.name.as_str())), (ID_MONITOR + i as u16) as usize, &label);
+        }
+        append(menu, MF_POPUP, mons.0 as usize, "表示するモニター");
+
         let pos = CreatePopupMenu().unwrap_or_default();
         append(pos, MF_STRING | check(cfg.anchor == Anchor::BesideTray), ID_ANCHOR_TRAY as usize, "通知領域の左 (位置リセット)");
         append(pos, MF_STRING | check(cfg.anchor == Anchor::Left), ID_ANCHOR_LEFT as usize, "タスクバーの左端 (位置リセット)");
@@ -358,6 +411,33 @@ pub fn pick_color(owner: HWND, current: u32) -> Option<u32> {
         if ChooseColorW(&mut cc).as_bool() {
             let c = cc.rgbResult.0;
             Some(((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF))
+        } else {
+            None
+        }
+    }
+}
+
+/// Standard "open file" dialog for the mascot image. Returns the chosen path.
+pub fn pick_image(owner: HWND) -> Option<String> {
+    let filter: Vec<u16> = "画像 (GIF, PNG, JPEG, WebP, BMP)\0*.gif;*.png;*.jpg;*.jpeg;*.webp;*.bmp\0すべてのファイル\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut file = vec![0u16; 1024];
+    let title = wide("ミニキャラに表示する画像 / GIF を選択");
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(file.as_mut_ptr()),
+        nMaxFile: file.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    unsafe {
+        if GetOpenFileNameW(&mut ofn).as_bool() {
+            let len = file.iter().position(|c| *c == 0).unwrap_or(file.len());
+            Some(String::from_utf16_lossy(&file[..len]))
         } else {
             None
         }

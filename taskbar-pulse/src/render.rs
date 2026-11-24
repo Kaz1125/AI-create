@@ -19,7 +19,8 @@ use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::anim::Visual;
 use crate::battery_kind_glyph;
-use crate::config::{Config, Item, Palette, VizStyle};
+use crate::config::{Character, Config, Item, Palette, VizStyle};
+use crate::mascot::Animation;
 use crate::media::{Art, MediaInfo};
 
 /// One horizontal piece of the overlay.
@@ -43,6 +44,10 @@ pub enum Segment {
         bars: Vec<f32>,
         peaks: Option<Vec<f32>>,
     },
+    /// Built-in character at animation phase `phase` (seconds of motion).
+    Character { kind: Character, phase: f32 },
+    /// One frame of a user image / GIF.
+    Image { anim: Arc<Animation>, frame: usize },
 }
 
 pub struct Renderer {
@@ -58,6 +63,8 @@ pub struct Renderer {
     dib: Option<(HDC, HBITMAP, HGDIOBJ, i32, i32)>,
     /// Album art bitmap for the current render target, keyed by Art::id.
     art_cache: Option<(u64, ID2D1Bitmap)>,
+    /// Mascot image frames uploaded to the current render target, keyed by Animation::id.
+    gif_cache: Option<(u64, Vec<Option<ID2D1Bitmap>>)>,
     started: Instant,
     /// Horizontal range of the media segment in window pixels (for click handling).
     pub media_hit: Option<(f32, f32)>,
@@ -133,6 +140,7 @@ impl Renderer {
                 fmt_key: 0,
                 dib: None,
                 art_cache: None,
+                gif_cache: None,
                 started: Instant::now(),
                 media_hit: None,
                 marquee_active: false,
@@ -151,6 +159,7 @@ impl Renderer {
     fn drop_target(&mut self) {
         self.target = None;
         self.art_cache = None; // bitmaps belong to the render target
+        self.gif_cache = None;
     }
 
     pub fn is_hardware(&self) -> bool {
@@ -302,6 +311,8 @@ impl Renderer {
                     art_w + icon_w + if cfg.marquee { text_w.min(max) } else { text_w }
                 }
                 Segment::Visualizer { bars, .. } => bars.len() as f32 * VIZ_STEP * scale,
+                Segment::Character { .. } => mascot_size(h),
+                Segment::Image { anim, .. } => mascot_size(h) * anim.width as f32 / anim.height.max(1) as f32,
             };
             widths.push(w + gap);
         }
@@ -396,6 +407,22 @@ impl Renderer {
                     Segment::Visualizer { bars, peaks } => {
                         self.draw_visualizer(&target, x, seg_w, h, scale, cfg.visualizer_style, &pal, bars, peaks.as_deref())?;
                     }
+                    Segment::Character { kind, phase } => {
+                        self.draw_character(&target, x, h, scale, &pal, *kind, *phase)?;
+                    }
+                    Segment::Image { anim, frame } => {
+                        if let Some(bmp) = self.gif_bitmap(&target, anim, *frame) {
+                            let sz = mascot_size(h);
+                            let top = (h - sz) / 2.0;
+                            target.DrawBitmap(
+                                &bmp,
+                                Some(&rect(x, top, x + seg_w, top + sz)),
+                                1.0,
+                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                None,
+                            );
+                        }
+                    }
                 }
                 x += w;
             }
@@ -406,6 +433,148 @@ impl Renderer {
             }
         }
         Ok((dc, total, height))
+    }
+
+    fn gif_bitmap(&mut self, target: &ID2D1DCRenderTarget, anim: &Animation, frame: usize) -> Option<ID2D1Bitmap> {
+        if self.gif_cache.as_ref().map(|(id, _)| *id) != Some(anim.id) {
+            self.gif_cache = Some((anim.id, vec![None; anim.frames.len()]));
+        }
+        let (_, cache) = self.gif_cache.as_mut()?;
+        if let Some(b) = cache.get(frame)?.clone() {
+            return Some(b);
+        }
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let f = &anim.frames[frame];
+        let bmp = unsafe {
+            target
+                .CreateBitmap(
+                    D2D_SIZE_U { width: anim.width, height: anim.height },
+                    Some(f.pixels.as_ptr() as _),
+                    anim.width * 4,
+                    &props,
+                )
+                .ok()?
+        };
+        cache[frame] = Some(bmp.clone());
+        Some(bmp)
+    }
+
+    /// Original procedurally drawn mascots, tinted with the theme gradient.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_character(
+        &self,
+        target: &ID2D1DCRenderTarget,
+        x: f32,
+        h: f32,
+        scale: f32,
+        pal: &Palette,
+        kind: Character,
+        t: f32,
+    ) -> Result<()> {
+        use std::f32::consts::PI;
+        let sz = mascot_size(h);
+        let top = (h - sz) / 2.0;
+        let cx = x + sz / 2.0;
+        let body = self.vertical_gradient(target, top, top + sz, &[(0.0, pal.gradient[0], 1.0), (1.0, pal.gradient[1], 1.0)])?;
+        let eye = target.CreateSolidColorBrush(&color(0x1A1A24, 1.0), None)?;
+        let shine = target.CreateSolidColorBrush(&color(0xFFFFFF, 0.85), None)?;
+        let cheek = target.CreateSolidColorBrush(&color(pal.gradient[2], 0.55), None)?;
+        let ellipse = |px: f32, py: f32, rx: f32, ry: f32| D2D1_ELLIPSE { point: pt(px, py), radiusX: rx, radiusY: ry };
+        // Blink for 0.12 s every 3.5 s.
+        let blink = (t % 3.5) < 0.12;
+        let eyes = |ex: f32, ey: f32, gap: f32, r: f32| {
+            for side in [-1.0, 1.0] {
+                let px = ex + side * gap;
+                if blink {
+                    target.FillRoundedRectangle(&rounded(px - r, ey - 0.6 * scale, px + r, ey + 0.6 * scale, 0.6 * scale), &eye);
+                } else {
+                    target.FillEllipse(&ellipse(px, ey, r, r * 1.15), &eye);
+                    target.FillEllipse(&ellipse(px - r * 0.35, ey - r * 0.4, r * 0.38, r * 0.38), &shine);
+                }
+            }
+        };
+
+        match kind {
+            Character::Slime | Character::Image => {
+                // Bounce: up in a sine arc, squash on landing.
+                let cycle = (t * 1.6) % 1.0;
+                let hop = (cycle * PI).sin();
+                let squash = if hop < 0.15 { 1.0 - (0.15 - hop) * 1.6 } else { 1.0 };
+                let w = sz * 0.46 / squash.sqrt();
+                let hh = sz * 0.36 * squash;
+                let ground = top + sz - 1.0 * scale;
+                let cy = ground - hh - hop * sz * 0.18;
+                let shadow = target.CreateSolidColorBrush(&color(0x000000, 0.25 * (1.0 - hop * 0.6)), None)?;
+                target.FillEllipse(&ellipse(cx, ground, w * (0.8 - hop * 0.25), 1.6 * scale), &shadow);
+                // Dome-shaped body: ellipse plus a flat-ish bottom.
+                target.FillEllipse(&ellipse(cx, cy + hh * 0.15, w, hh), &body);
+                target.FillEllipse(&ellipse(cx - w * 0.45, cy - hh * 0.35, w * 0.16, hh * 0.18), &shine);
+                eyes(cx, cy + hh * 0.05, w * 0.32, sz * 0.055);
+                target.FillEllipse(&ellipse(cx - w * 0.62, cy + hh * 0.32, sz * 0.06, sz * 0.035), &cheek);
+                target.FillEllipse(&ellipse(cx + w * 0.62, cy + hh * 0.32, sz * 0.06, sz * 0.035), &cheek);
+            }
+            Character::Cat => {
+                let bob = (t * 2.2 * PI).sin() * sz * 0.04;
+                let r = sz * 0.34;
+                let cy = top + sz * 0.58 + bob;
+                // Ears: triangles; the right ear twitches now and then.
+                let twitch = if (t % 4.7) < 0.18 { -0.25 } else { 0.0 };
+                for (side, tilt) in [(-1.0f32, 0.0f32), (1.0, twitch)] {
+                    let g = self.d2d.CreatePathGeometry()?;
+                    let sink = g.Open()?;
+                    let bx = cx + side * r * 0.62;
+                    sink.BeginFigure(pt(bx - side * r * 0.42, cy - r * 0.55), D2D1_FIGURE_BEGIN_FILLED);
+                    sink.AddLine(pt(bx + side * r * (0.28 + tilt), cy - r * (1.35 + tilt * 0.4)));
+                    sink.AddLine(pt(bx + side * r * 0.38, cy - r * 0.25));
+                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink.Close()?;
+                    target.FillGeometry(&g, &body, None);
+                }
+                target.FillEllipse(&ellipse(cx, cy, r * 1.08, r * 0.92), &body);
+                eyes(cx, cy - r * 0.08, r * 0.42, sz * 0.05);
+                // Nose and whisker-ish mouth.
+                target.FillEllipse(&ellipse(cx, cy + r * 0.22, sz * 0.03, sz * 0.022), &cheek);
+                let mouth = target.CreateSolidColorBrush(&color(0x1A1A24, 0.7), None)?;
+                target.DrawLine(pt(cx, cy + r * 0.26), pt(cx - r * 0.16, cy + r * 0.4), &mouth, 0.9 * scale, None);
+                target.DrawLine(pt(cx, cy + r * 0.26), pt(cx + r * 0.16, cy + r * 0.4), &mouth, 0.9 * scale, None);
+                target.FillEllipse(&ellipse(cx - r * 0.66, cy + r * 0.25, sz * 0.06, sz * 0.035), &cheek);
+                target.FillEllipse(&ellipse(cx + r * 0.66, cy + r * 0.25, sz * 0.06, sz * 0.035), &cheek);
+            }
+            Character::Ghost => {
+                let float = (t * 1.3 * PI).sin() * sz * 0.07;
+                let w = sz * 0.36;
+                let head_y = top + sz * 0.38 + float;
+                let hem_y = top + sz * 0.86 + float;
+                let g = self.d2d.CreatePathGeometry()?;
+                let sink = g.Open()?;
+                sink.BeginFigure(pt(cx - w, hem_y), D2D1_FIGURE_BEGIN_FILLED);
+                sink.AddLine(pt(cx - w, head_y));
+                // Round head: two quadratic arcs.
+                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT { point1: pt(cx - w, head_y - w * 1.25), point2: pt(cx, head_y - w * 1.25) });
+                sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT { point1: pt(cx + w, head_y - w * 1.25), point2: pt(cx + w, head_y) });
+                sink.AddLine(pt(cx + w, hem_y));
+                // Wavy hem that ripples over time.
+                let waves = 3;
+                for i in 0..waves {
+                    let x0 = cx + w - (i as f32) * (2.0 * w / waves as f32);
+                    let x1 = x0 - 2.0 * w / waves as f32;
+                    let dip = (t * 4.0 + i as f32 * 1.7).sin() * sz * 0.05 + sz * 0.07;
+                    sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT { point1: pt((x0 + x1) / 2.0, hem_y + dip), point2: pt(x1, hem_y) });
+                }
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.Close()?;
+                body.SetOpacity(0.92);
+                target.FillGeometry(&g, &body, None);
+                body.SetOpacity(1.0);
+                eyes(cx, head_y - w * 0.15, w * 0.38, sz * 0.055);
+                target.FillEllipse(&ellipse(cx, head_y + w * 0.25, sz * 0.035, sz * 0.045), &eye);
+            }
+        }
+        Ok(())
     }
 
     unsafe fn gradient(&self, target: &ID2D1DCRenderTarget, x0: f32, x1: f32, stops: &[(f32, u32, f32)]) -> Result<ID2D1LinearGradientBrush> {
@@ -656,6 +825,10 @@ impl Renderer {
     }
 }
 
+fn mascot_size(h: f32) -> f32 {
+    (h * 0.8).round()
+}
+
 fn art_size(h: f32) -> f32 {
     (h * 0.64).round()
 }
@@ -696,7 +869,9 @@ pub fn build_segments(
     media: Option<&MediaInfo>,
     viz: Option<Vec<f32>>,
     peaks: Option<Vec<f32>>,
+    mascot: Option<Segment>,
 ) -> Vec<Segment> {
+    let mut mascot = mascot;
     let snap = &visual.shown;
     let mut out = Vec::new();
     // Value colour: ramp by load/temperature when enabled, otherwise red only when critical.
@@ -809,6 +984,11 @@ pub fn build_segments(
             Item::Visualizer => {
                 if let Some(bars) = &viz {
                     out.push(Segment::Visualizer { bars: bars.clone(), peaks: peaks.clone() });
+                }
+            }
+            Item::Mascot => {
+                if let Some(m) = mascot.take() {
+                    out.push(m);
                 }
             }
         }
