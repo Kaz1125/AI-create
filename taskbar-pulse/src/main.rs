@@ -13,7 +13,7 @@ mod sensors;
 mod tray;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +36,11 @@ use sensors::Snapshot;
 pub const WM_APP_SENSORS: u32 = WM_APP + 1;
 pub const WM_APP_MEDIA: u32 = WM_APP + 2;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
+/// Sent to the controller when the strip window was destroyed by someone else
+/// (e.g. Explorer restarted and took its child windows with it).
+const WM_APP_RECREATE: u32 = WM_APP + 4;
+/// A mascot image finished loading on its worker thread.
+const WM_APP_MASCOT: u32 = WM_APP + 5;
 const TIMER_ANIM: usize = 1;
 const TIMER_POSITION: usize = 2;
 
@@ -49,8 +54,22 @@ pub fn battery_kind_glyph(kind: DeviceKind) -> char {
     }
 }
 
+/// Hidden top-level window that owns the tray icon, timers and worker messages.
+/// It outlives the strip window, which may be re-created.
+static CTRL: AtomicIsize = AtomicIsize::new(0);
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+fn ctrl_hwnd() -> HWND {
+    HWND(CTRL.load(Ordering::Relaxed) as _)
+}
+
 struct App {
+    /// The visible strip.
     hwnd: HWND,
+    /// Taskbar window the strip is currently embedded in (None = floating topmost window).
+    parent: Option<HWND>,
+    /// Last position given to the embedded child (client coordinates of `parent`).
+    child_pos: Option<(i32, i32)>,
     config: Config,
     renderer: render::Renderer,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -66,6 +85,8 @@ struct App {
     anim_idle: bool,
     /// Loaded mascot image and the path it came from.
     mascot_image: Option<(String, Arc<mascot::Animation>)>,
+    /// Result handed over from the loader thread: (path, image, picked by the user now).
+    mascot_pending: Arc<Mutex<Option<(String, Option<mascot::Animation>, bool)>>>,
     /// Seconds of mascot motion (advances faster under CPU load when enabled).
     mascot_phase: f32,
     last_mascot_frame: usize,
@@ -128,7 +149,24 @@ impl App {
                     Anchor::BesideTray => p.tray_left - off - w,
                     Anchor::Left => p.taskbar.left + off,
                 };
-                render::present(self.hwnd, dc, x, p.taskbar.top, w, h);
+                self.attach(p.window);
+                match self.parent {
+                    Some(parent) => {
+                        // Child window: position is in the taskbar's client coordinates.
+                        let mut pt = POINT { x, y: p.taskbar.top };
+                        unsafe {
+                            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(parent, &mut pt);
+                        }
+                        render::present_child(self.hwnd, dc, w, h);
+                        if self.child_pos != Some((pt.x, pt.y)) {
+                            self.child_pos = Some((pt.x, pt.y));
+                            unsafe {
+                                let _ = SetWindowPos(self.hwnd, Some(HWND_TOP), pt.x, pt.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                            }
+                        }
+                    }
+                    None => render::present(self.hwnd, dc, x, p.taskbar.top, w, h),
+                }
             }
             Err(_) => {}
         }
@@ -151,27 +189,41 @@ impl App {
         }
     }
 
-    /// Loads the chosen image when the path changed. Returns false if it could not be read.
-    fn load_mascot_image(&mut self) -> bool {
-        let wanted = match (&self.config.mascot, &self.config.mascot_image) {
-            (config::Character::Image, Some(p)) => p.clone(),
-            _ => {
-                self.mascot_image = None;
-                return true;
+    /// Starts loading `path` on a worker thread. Decoding a big GIF can take a moment, and
+    /// while embedded our UI thread shares input with the taskbar, so it must not block.
+    /// `user_picked` = show an error if it fails and switch to it when it succeeds.
+    fn request_mascot_load(&mut self, path: String, user_picked: bool) {
+        let slot = self.mascot_pending.clone();
+        let ctrl = CTRL.load(Ordering::Relaxed);
+        let _ = std::thread::Builder::new().name("mascot-load".into()).spawn(move || {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
-        };
-        if self.mascot_image.as_ref().map(|(p, _)| p == &wanted).unwrap_or(false) {
-            return true;
-        }
-        match mascot::load(std::path::Path::new(&wanted)) {
+            let anim = mascot::load(std::path::Path::new(&path));
+            *slot.lock().unwrap() = Some((path, anim, user_picked));
+            unsafe {
+                let _ = PostMessageW(Some(HWND(ctrl as _)), WM_APP_MASCOT, WPARAM(0), LPARAM(0));
+            }
+        });
+    }
+
+    /// Handles a finished load. Returns false when a user-picked image failed.
+    fn on_mascot_loaded(&mut self) -> bool {
+        let Some((path, anim, user_picked)) = self.mascot_pending.lock().unwrap().take() else { return true };
+        match anim {
             Some(anim) => {
-                self.mascot_image = Some((wanted, Arc::new(anim)));
+                self.mascot_image = Some((path.clone(), Arc::new(anim)));
+                if user_picked {
+                    self.config.mascot = config::Character::Image;
+                    self.config.mascot_image = Some(path);
+                    if !self.config.has(Item::Mascot) {
+                        self.config.toggle(Item::Mascot);
+                    }
+                }
+                self.apply_config();
                 true
             }
-            None => {
-                self.mascot_image = None;
-                false
-            }
+            None => !user_picked,
         }
     }
 
@@ -244,9 +296,9 @@ impl App {
             || self.config.has(Item::Mascot)
             || self.config.smooth_numbers;
         unsafe {
-            let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
+            let _ = KillTimer(Some(ctrl_hwnd()), TIMER_ANIM);
             if let Some(ms) = self.config.frame_ms().filter(|_| wants_anim) {
-                SetTimer(Some(self.hwnd), TIMER_ANIM, ms, None);
+                SetTimer(Some(ctrl_hwnd()), TIMER_ANIM, ms, None);
             }
         }
         self.last_frame = Instant::now();
@@ -254,7 +306,51 @@ impl App {
         self.redraw();
     }
 
-    fn keep_on_top(&self) {
+    /// Embeds the strip into `taskbar` (when enabled), or turns it back into a floating
+    /// topmost window. If embedding fails, falls back to floating.
+    fn attach(&mut self, taskbar: Option<HWND>) {
+        let wanted = if self.config.embed { taskbar } else { None };
+        if wanted == self.parent && self.parent.is_none_or(|p| unsafe { IsWindow(Some(p)).as_bool() }) {
+            return;
+        }
+        self.child_pos = None;
+        unsafe {
+            if let Some(parent) = wanted {
+                SetWindowLongPtrW(self.hwnd, GWL_STYLE, (WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE).0 as isize);
+                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, (WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW).0 as isize);
+                if SetParent(self.hwnd, Some(parent)).is_ok() {
+                    self.parent = Some(parent);
+                    let _ = SetWindowPos(self.hwnd, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                    return;
+                }
+            }
+            // Floating mode (or embedding failed).
+            let _ = SetParent(self.hwnd, None);
+            SetWindowLongPtrW(self.hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
+            SetWindowLongPtrW(
+                self.hwnd,
+                GWL_EXSTYLE,
+                (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE).0 as isize,
+            );
+            self.parent = None;
+            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+    }
+
+    fn keep_on_top(&mut self) {
+        if let Some(parent) = self.parent {
+            unsafe {
+                if !IsWindow(Some(parent)).as_bool() {
+                    // Taskbar went away (Explorer restart); re-attach on the next draw.
+                    self.parent = None;
+                    self.redraw();
+                    return;
+                }
+                // Stay above the taskbar's own child windows.
+                let _ = SetWindowPos(self.hwnd, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            return;
+        }
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -273,7 +369,7 @@ fn lparam_x(lparam: LPARAM) -> i32 {
     (lparam.0 & 0xFFFF) as i16 as i32
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn ctrl_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_APP_SENSORS => {
             with_app(|app| app.on_sensors());
@@ -298,8 +394,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_COMMAND => {
+            handle_command(hwnd, (wparam.0 & 0xFFFF) as u16);
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+            with_app(|app| app.redraw());
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_APP_MASCOT => {
+            let ok = with_app(|app| app.on_mascot_loaded()).unwrap_or(true);
+            if !ok {
+                MessageBoxW(
+                    Some(hwnd),
+                    w!("画像を読み込めませんでした。GIF / PNG / JPEG / WebP などの画像ファイルを選んでください。"),
+                    w!("Taskbar Pulse"),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            LRESULT(0)
+        }
+        WM_APP_RECREATE => {
+            with_app(|app| {
+                if let Ok(strip) = create_strip() {
+                    app.hwnd = strip;
+                    app.parent = None;
+                    app.child_pos = None;
+                    let _ = ShowWindow(strip, SW_SHOWNOACTIVATE);
+                    app.redraw();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            tray::remove(hwnd);
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => {
+            let recreated = with_app(|app| app.taskbar_created_msg).unwrap_or(0);
+            if recreated != 0 && msg == recreated {
+                // Explorer restarted: the tray icon must be added again.
+                tray::add(hwnd);
+                with_app(|app| {
+                    app.parent = None;
+                    app.redraw();
+                });
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+/// Window procedure of the visible strip: mouse interaction only.
+unsafe extern "system" fn strip_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
         WM_RBUTTONUP => {
-            show_menu(hwnd);
+            show_menu(ctrl_hwnd());
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -357,29 +509,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             });
             LRESULT(0)
         }
-        WM_COMMAND => {
-            handle_command(hwnd, (wparam.0 & 0xFFFF) as u16);
-            LRESULT(0)
-        }
-        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
-            with_app(|app| app.redraw());
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
         WM_DESTROY => {
-            tray::remove(hwnd);
-            PostQuitMessage(0);
+            // Destroyed by someone else (e.g. Explorer restart destroys its child windows):
+            // ask the controller to build a new strip.
+            if !EXITING.load(Ordering::Relaxed) {
+                let _ = PostMessageW(Some(ctrl_hwnd()), WM_APP_RECREATE, WPARAM(0), LPARAM(0));
+            }
             LRESULT(0)
         }
-        _ => {
-            let recreated = with_app(|app| app.taskbar_created_msg).unwrap_or(0);
-            if recreated != 0 && msg == recreated {
-                // Explorer restarted: the tray icon must be added again.
-                tray::add(hwnd);
-                with_app(|app| app.redraw());
-                return LRESULT(0);
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn create_strip() -> windows::core::Result<HWND> {
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            w!("TaskbarPulseOverlay"),
+            w!("Taskbar Pulse"),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
     }
 }
 
@@ -478,32 +636,7 @@ fn handle_command(hwnd: HWND, id: u16) {
         }
         tray::Action::PickImage => {
             if let Some(path) = tray::pick_image(hwnd) {
-                let ok = with_app(|app| {
-                    let previous = (app.config.mascot, app.config.mascot_image.clone());
-                    app.config.mascot = config::Character::Image;
-                    app.config.mascot_image = Some(path.clone());
-                    if !app.config.has(Item::Mascot) {
-                        app.config.toggle(Item::Mascot);
-                    }
-                    let ok = app.load_mascot_image();
-                    if !ok {
-                        (app.config.mascot, app.config.mascot_image) = previous;
-                        app.load_mascot_image();
-                    }
-                    app.apply_config();
-                    ok
-                })
-                .unwrap_or(false);
-                if !ok {
-                    unsafe {
-                        MessageBoxW(
-                            Some(hwnd),
-                            w!("画像を読み込めませんでした。GIF / PNG / JPEG / WebP などの画像ファイルを選んでください。"),
-                            w!("Taskbar Pulse"),
-                            MB_OK | MB_ICONWARNING,
-                        );
-                    }
-                }
+                with_app(|app| app.request_mascot_load(path, true));
             }
         }
         tray::Action::ToggleMascotSpeed => {
@@ -551,10 +684,21 @@ fn handle_command(hwnd: HWND, id: u16) {
                 ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
             }
         }
-        tray::Action::Exit => unsafe {
+        tray::Action::ToggleEmbed => {
             with_app(|app| {
-                let _ = app.media_tx.send(MediaCommand::Quit);
+                app.config.embed = !app.config.embed;
+                app.apply_config();
             });
+        }
+        tray::Action::Exit => unsafe {
+            EXITING.store(true, Ordering::Relaxed);
+            let strip = with_app(|app| {
+                let _ = app.media_tx.send(MediaCommand::Quit);
+                app.hwnd
+            });
+            if let Some(strip) = strip {
+                let _ = DestroyWindow(strip);
+            }
             let _ = DestroyWindow(hwnd);
         },
         tray::Action::None => {}
@@ -586,34 +730,44 @@ fn main() -> windows::core::Result<()> {
 
         let config = Config::load();
         let instance = GetModuleHandleW(None)?;
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(wndproc),
+        let cursor = LoadCursorW(None, IDC_ARROW)?;
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(strip_proc),
             hInstance: instance.into(),
             lpszClassName: w!("TaskbarPulseOverlay"),
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hCursor: cursor,
             ..Default::default()
-        };
-        RegisterClassW(&class);
-        let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            w!("TaskbarPulseOverlay"),
-            w!("Taskbar Pulse"),
+        });
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(ctrl_proc),
+            hInstance: instance.into(),
+            lpszClassName: w!("TaskbarPulseController"),
+            ..Default::default()
+        });
+        // Hidden controller window (never shown). Not message-only, so it still receives
+        // the "TaskbarCreated" broadcast after Explorer restarts.
+        let ctrl = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            w!("TaskbarPulseController"),
+            w!("Taskbar Pulse Controller"),
             WS_POPUP,
             0,
             0,
-            10,
-            10,
+            0,
+            0,
             None,
             None,
             Some(instance.into()),
             None,
         )?;
+        CTRL.store(ctrl.0 as isize, Ordering::Relaxed);
+        let hwnd = create_strip()?;
 
         // --- Worker threads ---
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let sensor_interval = Arc::new(AtomicU32::new(config.sensor_ms()));
         let want_devices = Arc::new(AtomicBool::new(config.has(Item::Devices)));
-        let hwnd_raw = hwnd.0 as isize;
+        let hwnd_raw = ctrl.0 as isize;
         let (hybrid_tx, hybrid_rx) = channel();
         {
             let (snapshot, interval, want_devices) = (snapshot.clone(), sensor_interval.clone(), want_devices.clone());
@@ -658,6 +812,8 @@ fn main() -> windows::core::Result<()> {
 
         let app = App {
             hwnd,
+            parent: None,
+            child_pos: None,
             renderer: render::Renderer::new()?,
             config,
             snapshot,
@@ -671,6 +827,7 @@ fn main() -> windows::core::Result<()> {
             last_frame: Instant::now(),
             anim_idle: false,
             mascot_image: None,
+            mascot_pending: Arc::new(Mutex::new(None)),
             mascot_phase: 0.0,
             last_mascot_frame: usize::MAX,
             hidden_for_fullscreen: false,
@@ -679,13 +836,15 @@ fn main() -> windows::core::Result<()> {
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|app| {
-            app.load_mascot_image();
+            if let (config::Character::Image, Some(p)) = (app.config.mascot, app.config.mascot_image.clone()) {
+                app.request_mascot_load(p, false);
+            }
             app.apply_config();
         });
 
-        tray::add(hwnd);
+        tray::add(ctrl);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        SetTimer(Some(hwnd), TIMER_POSITION, 2000, None);
+        SetTimer(Some(ctrl), TIMER_POSITION, 2000, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

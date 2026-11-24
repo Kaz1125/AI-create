@@ -996,6 +996,22 @@ pub fn build_segments(
     out
 }
 
+/// Updates an embedded (child) layered window's pixels and size; its position is set
+/// separately in the parent's client coordinates.
+pub fn present_child(hwnd: HWND, dc: HDC, w: i32, h: i32) {
+    unsafe {
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let size = SIZE { cx: w, cy: h };
+        let src = POINT { x: 0, y: 0 };
+        let _ = UpdateLayeredWindow(hwnd, None, None, Some(&size), Some(dc), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
+    }
+}
+
 /// Pushes the rendered DIB to the layered window at the given screen position.
 pub fn present(hwnd: HWND, dc: HDC, x: i32, y: i32, w: i32, h: i32) {
     unsafe {

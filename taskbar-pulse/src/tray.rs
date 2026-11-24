@@ -31,6 +31,7 @@ const ID_PICK_IMAGE: u16 = 510;
 const ID_MASCOT_SPEED: u16 = 511;
 const ID_MONITOR_PRIMARY: u16 = 520;
 const ID_MONITOR: u16 = 521;
+const ID_EMBED: u16 = 530;
 const ID_SENSOR: u16 = 540;
 const ID_FPS: u16 = 560;
 const ID_RENDER: u16 = 580;
@@ -113,6 +114,7 @@ pub enum Action {
     /// None = primary monitor.
     SetMonitor(Option<String>),
     SetSensorOverride(Option<u32>),
+    ToggleEmbed,
     SetFpsOverride(Option<u32>),
     SetRender(RenderChoice),
     ToggleFullscreenHide,
@@ -168,6 +170,7 @@ pub fn decode(id: u16) -> Action {
             Action::SetFpsOverride(FPS_PRESETS[(i - ID_FPS) as usize])
         }
         i if (ID_RENDER..ID_RENDER + RENDERS.len() as u16).contains(&i) => Action::SetRender(RENDERS[(i - ID_RENDER) as usize]),
+        ID_EMBED => Action::ToggleEmbed,
         ID_FULLSCREEN => Action::ToggleFullscreenHide,
         ID_AUTOSTART => Action::ToggleAutostart,
         ID_OPEN_CONFIG => Action::OpenConfig,
@@ -414,6 +417,8 @@ pub fn show_menu(hwnd: HWND, cfg: &Config, hybrid: bool, hardware_active: bool) 
         let pos = CreatePopupMenu().unwrap_or_default();
         append(pos, MF_STRING | check(cfg.anchor == Anchor::BesideTray), ID_ANCHOR_TRAY as usize, "通知領域の左 (位置リセット)");
         append(pos, MF_STRING | check(cfg.anchor == Anchor::Left), ID_ANCHOR_LEFT as usize, "タスクバーの左端 (位置リセット)");
+        append(pos, MF_SEPARATOR, 0, "");
+        append(pos, MF_STRING | check(cfg.embed), ID_EMBED as usize, "タスクバーに埋め込む (おすすめ・ちらつき防止)");
         append(pos, MF_SEPARATOR, 0, "");
         append(pos, MF_STRING | MF_GRAYED, 0, "表示部分を左ドラッグで位置調整できます");
         append(menu, MF_POPUP, pos.0 as usize, "表示位置");

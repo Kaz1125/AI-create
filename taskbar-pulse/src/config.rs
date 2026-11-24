@@ -311,6 +311,9 @@ pub struct Config {
     /// Advanced: CPU or GPU drawing.
     pub render: RenderChoice,
     pub anchor: Anchor,
+    /// Embed the strip into the taskbar as a child window (no z-order flicker).
+    /// Off = floating always-on-top window over the taskbar.
+    pub embed: bool,
     /// Extra horizontal offset in pixels (positive moves left for BesideTray, right for Left).
     pub offset_x: i32,
     /// Font size in DIPs (scaled by monitor DPI).
@@ -381,6 +384,7 @@ impl Default for Config {
             fps_override: None,
             render: RenderChoice::Auto,
             anchor: Anchor::BesideTray,
+            embed: true,
             offset_x: 8,
             font_size: 13.0,
             hide_in_fullscreen: true,

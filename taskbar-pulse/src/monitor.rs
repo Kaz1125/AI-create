@@ -48,6 +48,8 @@ pub struct Placement {
     /// X coordinate our strip should end at when anchored beside the tray / clock.
     pub tray_left: i32,
     pub scale: f32,
+    /// The taskbar window itself (to embed into), or None when using the screen edge.
+    pub window: Option<HWND>,
 }
 
 fn monitor_scale(mon: HMONITOR) -> f32 {
@@ -74,7 +76,7 @@ fn primary_taskbar() -> Option<Placement> {
             })
             .filter(|l| *l > rect.left && *l < rect.right)
             .unwrap_or(rect.right - (320.0 * scale) as i32);
-        Some(Placement { taskbar: rect, tray_left, scale })
+        Some(Placement { taskbar: rect, tray_left, scale, window: Some(taskbar) })
     }
 }
 
@@ -91,7 +93,7 @@ fn secondary(mon: &MonitorInfo) -> Placement {
                 if GetWindowRect(hwnd, &mut rect).is_ok() {
                     // Leave room for the clock that secondary taskbars can show on the right.
                     let tray_left = rect.right - (150.0 * scale) as i32;
-                    return Placement { taskbar: rect, tray_left, scale };
+                    return Placement { taskbar: rect, tray_left, scale, window: Some(hwnd) };
                 }
             }
         }
@@ -102,6 +104,7 @@ fn secondary(mon: &MonitorInfo) -> Placement {
         taskbar: RECT { left: r.left, top: r.bottom - h, right: r.right, bottom: r.bottom },
         tray_left: r.right - (16.0 * scale) as i32,
         scale,
+        window: None,
     }
 }
 
